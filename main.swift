@@ -456,6 +456,43 @@ func runBehaviorTest() {
                        landed ? "yes" : "NO", maxDS, maxDZ))
     }
 
+    bodyCheck("food: fly smells it, walks over, eats for 2s, then it's gone") {
+        let fly = Fly(at: .zero)
+        fly.state = .idle
+        // short distance: a long approach has a real (if small) chance of a
+        // spontaneous takeoff carrying the fly out of smell range mid-chase
+        // (arousal-gated, pre-existing behavior) -- not a food-seeking bug,
+        // just not this test's concern, so keep the window brief
+        let food = FoodTarget(id: 1, pos: CGPoint(x: 60, y: 0))
+        var frames = 0
+        while fly.state != .eating && frames < 200 {
+            frames += 1
+            fly.update(dt: dt, bounds: bounds, mouse: nil, food: food, signals: BrainSignals())
+        }
+        guard fly.state == .eating else { return (false, "never reached food: pos=\(fly.pos)") }
+        let approachFrames = frames
+        var eatFrames = 0
+        while fly.pendingEatenFoodId == nil && eatFrames < 300 {
+            eatFrames += 1
+            fly.update(dt: dt, bounds: bounds, mouse: nil, food: food, signals: BrainSignals())
+        }
+        let eatSeconds = CGFloat(eatFrames) * dt
+        let ok = fly.pendingEatenFoodId == 1 && fly.state == .idle
+            && eatSeconds > 1.8 && eatSeconds < 2.3
+        return (ok, String(format: "approached in %.2fs, ate for %.2fs, eaten id=%@, end state=%@",
+                           CGFloat(approachFrames) * dt, eatSeconds,
+                           fly.pendingEatenFoodId.map(String.init) ?? "nil", "\(fly.state)"))
+    }
+
+    bodyCheck("food: escape still pre-empts hunger") {
+        let fly = Fly(at: .zero)
+        fly.state = .idle
+        let food = FoodTarget(id: 2, pos: CGPoint(x: 40, y: 0))   // well within smell range
+        var s = BrainSignals(); s.escape = true
+        fly.update(dt: dt, bounds: bounds, mouse: nil, food: food, signals: s)
+        return (fly.state == .flying, "state=\(fly.state) (must escape, not veer toward food)")
+    }
+
     bodyCheck("circadian curve: siesta + night dips, dawn/dusk peaks") {
         let night = circadianActivity(hour: 3), dawn = circadianActivity(hour: 9)
         let siesta = circadianActivity(hour: 14), dusk = circadianActivity(hour: 18)
@@ -605,6 +642,11 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
     private var windowLoomR: Float = 0
     private(set) var lastFlyPos = CGPoint.zero
 
+    // food: positions (scene coords) come from AppDelegate polling each food
+    // window's on-screen frame — the windows themselves are the drag surface.
+    private var foodPositions: [Int: CGPoint] = [:]
+    private var eatenFoodIDs: [Int] = []
+
     init(bounds: CGSize, sim: LIFSim?, runner: SimRunner? = nil) {
         self.bounds = bounds
         self.sim = sim
@@ -679,6 +721,26 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
             c.windowLoomL = max(c.windowLoomL, Float(strength * clampf(0.5 + 0.5 * crossZ, 0.12, 1)))
             c.windowLoomR = max(c.windowLoomR, Float(strength * clampf(0.5 - 0.5 * crossZ, 0.12, 1)))
         }
+    }
+
+    func setFoodPositions(_ positions: [Int: CGPoint]) { enqueue { $0.foodPositions = positions } }
+
+    func consumeEatenFoodIDs() -> [Int] {
+        lock.lock(); defer { lock.unlock() }
+        let ids = eatenFoodIDs; eatenFoodIDs.removeAll(); return ids
+    }
+
+    // nearest unclaimed food within smell range of `from`; `claimed` is
+    // mutated so two flies in the same frame don't both beeline for one item
+    private func nearestFood(to from: CGPoint, claimed: inout Set<Int>) -> FoodTarget? {
+        var best: FoodTarget? = nil
+        var bestD = FOOD_SMELL_RADIUS
+        for (id, p) in foodPositions where !claimed.contains(id) {
+            let d = hypot(p.x - from.x, p.y - from.y)
+            if d < bestD { bestD = d; best = FoodTarget(id: id, pos: p) }
+        }
+        if let b = best { claimed.insert(b.id) }
+        return best
     }
 
     // a global mouse click: a tap on the fly's substrate -> sensory pathway
@@ -787,9 +849,19 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
             signals = s
         }
 
+        var claimedFood = Set(flies.compactMap { $0.eatingFoodId })
+        var justEaten: [Int] = []
         for (i, fly) in flies.enumerated() {
             fly.terrain = terrain
-            fly.update(dt: dt, bounds: bounds, mouse: mouse, signals: i == 0 ? signals : nil)
+            let food = fly.state == .eating ? nil : nearestFood(to: fly.pos, claimed: &claimedFood)
+            fly.update(dt: dt, bounds: bounds, mouse: mouse, food: food, signals: i == 0 ? signals : nil)
+            if let eaten = fly.pendingEatenFoodId {
+                justEaten.append(eaten)
+                fly.pendingEatenFoodId = nil
+            }
+        }
+        if !justEaten.isEmpty {
+            lock.lock(); eatenFoodIDs.append(contentsOf: justEaten); lock.unlock()
         }
         if let first = flies.first {
             lock.lock(); lastFlyPos = first.pos; lock.unlock()
@@ -819,6 +891,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var dataInfo = "no data — run etl.py"
     var screenFrame = NSRect.zero
     var moveDisplayItem: NSMenuItem?
+    var foodItems: [FoodItem] = []
+    var nextFoodId = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard let screen = NSScreen.main else { fatalError("no screen") }
@@ -901,6 +975,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let sleepy = (idle > 600 && (h >= 22 || h < 6)) || idle > 1800
             self.coordinator.setAmbient(typing: self.typingLevel, sleepy: sleepy,
                                         tempo: thermalTempo(), activity: circadianActivity(hour: h))
+
+            // food: publish each item's current (possibly just-dragged) screen
+            // position as a scene-space smell source, then sweep up anything
+            // a fly finished eating this tick
+            if !self.foodItems.isEmpty {
+                var positions: [Int: CGPoint] = [:]
+                for f in self.foodItems {
+                    let c = f.screenCenter
+                    positions[f.id] = CGPoint(x: c.x - self.screenFrame.midX, y: c.y - self.screenFrame.midY)
+                }
+                self.coordinator.setFoodPositions(positions)
+            }
+            for eatenId in self.coordinator.consumeEatenFoodIDs() {
+                if let idx = self.foodItems.firstIndex(where: { $0.id == eatenId }) {
+                    self.foodItems[idx].remove()
+                    self.foodItems.remove(at: idx)
+                }
+            }
         }
 
         // window terrain + new-window looms, ~1.4 Hz
@@ -976,6 +1068,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item("Remove Fly", #selector(removeFly), "r"))
         menu.addItem(item("Scare Flies", #selector(scareAll), "s"))
         menu.addItem(.separator())
+        menu.addItem(item("Add Food", #selector(addFood), "f"))
+        menu.addItem(item("Clear Food", #selector(clearFood), ""))
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
     }
@@ -994,6 +1089,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func addFly() { coordinator.addFly() }
     @objc func removeFly() { coordinator.removeFly() }
     @objc func scareAll() { coordinator.scareAll() }
+
+    @objc func addFood() {
+        // spawn near the click, nudged down off the menu bar itself so it
+        // isn't hidden under the still-closing menu; the user drags it from
+        // there to wherever on screen they want the fly to smell it
+        let loc = NSEvent.mouseLocation
+        let id = nextFoodId; nextFoodId += 1
+        let food = FoodItem(id: id, at: NSPoint(x: loc.x, y: loc.y - 50)) { [weak self] in
+            self?.removeFoodItem(id: id)
+        }
+        foodItems.append(food)
+    }
+    @objc func clearFood() {
+        for f in foodItems { f.remove(animated: false) }
+        foodItems.removeAll()
+        coordinator.setFoodPositions([:])
+    }
+    private func removeFoodItem(id: Int) {
+        guard let idx = foodItems.firstIndex(where: { $0.id == id }) else { return }
+        foodItems[idx].remove()
+        foodItems.remove(at: idx)
+    }
 }
 
 // MARK: - Entry point

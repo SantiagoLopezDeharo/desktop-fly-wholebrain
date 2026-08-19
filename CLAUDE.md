@@ -14,6 +14,7 @@ SceneKit; the brain data is real.
 | `Sim.swift` | data loading, `BrainSignals`, `SpikeBus`, `LIFSim` (CSR network, stimulation API) |
 | `BrainView.swift` | brain window: point clouds, click-to-stimulate, spike flashes |
 | `Environment.swift` | permission-free senses: `WindowSense` (ledges/looms), circadian curve, user idle, thermal tempo |
+| `Food.swift` | draggable food decals (`FoodItem`/`FoodPanelView`); positive-smell attraction lives in `Fly.foodSeek` (`FlyModel.swift`) |
 | `etl.py` | raw Codex dumps → `data/brain_points.json` + `data/circuit.json` |
 | `etl_fullbrain.py` | raw Codex dumps → `data/fullbrain.bin` (whole brain, binary CSR) |
 | `data/` | shipped derived data (CC BY-NC 4.0 — see `data/DATA_LICENSE.md`) |
@@ -58,10 +59,12 @@ Whole-brain specifics, all in `Sim.swift`:
 ```
 
 Always run **both** suites after any change; they are the ground truth.
-Two `--behaviortest` scenarios ("DNp09 stim -> walks", "ledge attach") are
-inherently flaky at **~3/25 runs** — measured on both the pre-whole-brain
-commit and after. Don't chase a single red run; take a 25-run sample before
-concluding you broke something.
+A handful of `--behaviortest` scenarios (seen so far: "DNp09 stim -> walks",
+"ledge attach", "threat while grounded raises wings", "thermal tempo") are
+inherently flaky at **roughly 4-5/25 runs total** — measured across several
+commits, pre- and post-whole-brain. Don't chase a single red run or assume the
+scenario name tells you which change caused it; take a 25-run sample on both
+the suspect commit and its parent before concluding you broke something.
 Key invariants: GF silent over 4 s of rest, GF fires ≤ ~10 ms after abrupt
 loom, walk-drive duty 20–50%, siesta (scale 0.84) walk-drive > 3%,
 no per-frame scale/z snap at landing.

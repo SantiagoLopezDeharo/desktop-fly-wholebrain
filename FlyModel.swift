@@ -11,6 +11,18 @@ let EDGE_MARGIN: CGFloat = 50
 let SCARE_RADIUS: CGFloat = 110        // legacy behavior (non-connectome flies) only
 let NERVOUS_RADIUS: CGFloat = 240      // legacy behavior only
 
+// Food: no real appetitive/olfactory circuit is wired in this subset of the
+// connectome (that would be a new-neuron-population project of its own — see
+// CLAUDE.md's recipe), so "smell" is modeled directly as a behavioral pull on
+// heading/speed, the same honesty tradeoff the README already makes for
+// window-loom stimuli. It still respects state priority: escape, sleep, and
+// an active dart/backward-walk all pre-empt it.
+let FOOD_SMELL_RADIUS: CGFloat = 260
+let FOOD_EAT_RADIUS: CGFloat = 16
+let FOOD_EAT_DURATION: CGFloat = 2.0
+
+struct FoodTarget { let id: Int; let pos: CGPoint }
+
 func rnd(_ range: ClosedRange<CGFloat>) -> CGFloat { CGFloat.random(in: range) }
 func clampf(_ v: CGFloat, _ lo: CGFloat, _ hi: CGFloat) -> CGFloat { min(hi, max(lo, v)) }
 func angleDiff(_ from: CGFloat, _ to: CGFloat) -> CGFloat {
@@ -251,7 +263,7 @@ func buildFlyModel() -> FlyModel {
 // MARK: - Behavior
 
 final class Fly {
-    enum State { case walking, idle, grooming, flying, sleeping }
+    enum State { case walking, idle, grooming, flying, sleeping, eating }
 
     let model: FlyModel
     var node: SCNNode { model.root }
@@ -270,6 +282,10 @@ final class Fly {
     var stateAge: CGFloat = 0
     var terrain: [Ledge] = []      // walkable window edges, set by the coordinator
     var ledge: Ledge?              // currently attached window edge
+
+    var eatTimer: CGFloat = 0
+    var eatingFoodId: Int?              // which food this fly is currently eating
+    var pendingEatenFoodId: Int?        // set once when eating finishes; coordinator drains it
 
     var gaitPhasePublic: CGFloat { gaitPhase }
     var walkingIntensity: CGFloat {
@@ -378,12 +394,12 @@ final class Fly {
                    heading += rnd(-1.5...1.5) }
         case .grooming:
             state = .idle; stateTimer = rnd(0.3...1.0)
-        case .flying, .sleeping:
-            break
+        case .flying, .sleeping, .eating:
+            break   // each has its own dedicated update path; never reached here
         }
     }
 
-    func update(dt: CGFloat, bounds: CGSize, mouse: CGPoint?, signals: BrainSignals?) {
+    func update(dt: CGFloat, bounds: CGSize, mouse: CGPoint?, food: FoodTarget? = nil, signals: BrainSignals?) {
         time += dt
         scareCooldown = max(0, scareCooldown - dt)
         dartCooldown = max(0, dartCooldown - dt)
@@ -399,9 +415,12 @@ final class Fly {
 
         if state == .flying {
             updateFlight(dt: dt)
+        } else if state == .eating {
+            updateEating(dt: dt)
         } else if let s = signals {
             brainBehavior(s, dt: dt, bounds: bounds, mouse: mouse)
             if state == .walking { updateWalk(dt: dt, bounds: bounds) }
+            foodSeek(food, dt: dt)
         } else {
             if scareCooldown == 0, let m = mouse {
                 // legacy distance-based fear (extra, brainless flies)
@@ -423,6 +442,7 @@ final class Fly {
                     else { pickNextState() }
                 }
                 if state == .walking { updateWalk(dt: dt, bounds: bounds) }
+                foodSeek(food, dt: dt)
             }
         }
 
@@ -501,6 +521,43 @@ final class Fly {
         let flightChance: CGFloat = s.arousal > 0.5 ? 0.6 : 0.005
         if state == .walking && rnd(0...1) < flightChance * dt {
             startFlight(bounds: bounds, effort: 0.35 + s.arousal * 0.6)
+        }
+    }
+
+    // Positive smell: steer and walk toward nearby food, strongest close up.
+    // Lower priority than everything upstream (escape/sleep/dart/backward all
+    // already returned or hold their own heading before this runs), so it
+    // only ever engages a fly that's otherwise free to wander.
+    private func foodSeek(_ food: FoodTarget?, dt: CGFloat) {
+        guard let food = food, dartTimer == 0, backwardTimer == 0,
+              state == .walking || state == .idle else { return }
+        let d = hypot(food.pos.x - pos.x, food.pos.y - pos.y)
+        guard d < FOOD_SMELL_RADIUS else { return }
+        if d < FOOD_EAT_RADIUS {
+            setState(.eating)
+            eatingFoodId = food.id
+            eatTimer = FOOD_EAT_DURATION
+            speed = 0
+            ledge = nil
+            return
+        }
+        if state != .walking { setState(.walking) }
+        ledge = nil
+        let target = atan2(food.pos.y - pos.y, food.pos.x - pos.x)
+        heading += angleDiff(heading, target) * min(1, 3.2 * dt)
+        let pull = clampf(1 - d / FOOD_SMELL_RADIUS, 0, 1)
+        let desired = 30 + pull * 70
+        speed += (desired - speed) * min(1, 2.4 * dt)
+    }
+
+    private func updateEating(dt: CGFloat) {
+        speed = 0
+        eatTimer -= dt
+        if eatTimer <= 0 {
+            pendingEatenFoodId = eatingFoodId
+            eatingFoodId = nil
+            setState(.idle)
+            stateTimer = rnd(0.3...0.8)
         }
     }
 
@@ -621,11 +678,12 @@ final class Fly {
                 if backwardTimer > 0 { leg.angle = -leg.angle }
                 leg.apply()
             }
-        } else if state == .grooming {
+        } else if state == .grooming || state == .eating {
+            let amp: CGFloat = state == .eating ? 0.15 : 0.25   // gentler nibble than a full groom
             for leg in model.legs {
                 if leg.isFront {
-                    leg.angle = 0.45 + 0.25 * sin(time * 20 + leg.swingSign * 1.3)
-                    leg.lift = 0.55 + 0.15 * sin(time * 22)
+                    leg.angle = 0.45 + amp * sin(time * 20 + leg.swingSign * 1.3)
+                    leg.lift = 0.55 + (amp * 0.6) * sin(time * 22)
                 } else {
                     leg.angle += (0 - leg.angle) * min(1, 8 * dt)
                     leg.lift += (0 - leg.lift) * min(1, 8 * dt)
