@@ -108,10 +108,21 @@ func runSnapshot(path: String) {
     offscreenRender(scene, camNode: camNode, size: CGSize(width: 720, height: 720), path: path)
 }
 
-func runBrainshot(path: String) {
-    guard let data = loadBrainData() else { fputs("no data/ — run etl.py first\n", stderr); exit(1) }
-    let sim = LIFSim(circuit: data.circuit, spikeBus: nil)
-    let bs = buildBrainScene(points: data.points, sim: sim)
+func runBrainshot(path: String, wholeBrain: Bool = false) {
+    let sim: LIFSim
+    let bs: BrainScene
+    if wholeBrain {
+        guard let fb = loadFullBrain() else {
+            fputs("no data/fullbrain.bin — run: python3 etl_fullbrain.py <raw_dir>\n", stderr); exit(1)
+        }
+        sim = LIFSim(fullBrain: fb, spikeBus: nil)
+        sim.step(1500)   // let homeostasis settle so the preview looks like steady state
+        bs = buildBrainScene(points: nil, sim: sim, wholeBrain: true)
+    } else {
+        guard let data = loadBrainData() else { fputs("no data/ — run etl.py first\n", stderr); exit(1) }
+        sim = LIFSim(circuit: data.circuit, spikeBus: nil)
+        bs = buildBrainScene(points: data.points, sim: sim, wholeBrain: false)
+    }
     bs.brainGroup.removeAllActions()
     bs.brainGroup.eulerAngles = SCNVector3(-0.15, 0.5, 0)
     // decorate with a burst of fake spikes so the preview shows the live look
@@ -824,7 +835,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let s = LIFSim(fullBrain: fb, spikeBus: spikeBus)
             sim = s
             runner = SimRunner(sim: s)
-            brainPoints = loadBrainData()?.points
+            // brainPoints stays nil: the brain window renders straight from
+            // sim's own 139k positions (see buildBrainScene), not the
+            // unrelated 668-circuit-era point cloud.
             dataInfo = "FlyWire v783 · WHOLE BRAIN · \(fb.n)n/\(fb.colIdx.count)e"
         } else {
             if wholeBrain {
@@ -864,8 +877,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.contentView = scnView
         window.orderFrontRegardless()
 
-        if let sim = sim, let pts = brainPoints {
-            let wc = BrainWindowController(points: pts, sim: sim, screen: screen)
+        if let sim = sim {
+            let wc = BrainWindowController(points: brainPoints, sim: sim, wholeBrain: wholeBrain, screen: screen)
             wc.show()
             brainWC = wc
         }
@@ -1114,7 +1127,8 @@ if let i = args.firstIndex(of: "--snapshot") {
     exit(0)
 }
 if let i = args.firstIndex(of: "--brainshot") {
-    runBrainshot(path: args.count > i + 1 ? args[i + 1] : "brain.png")
+    runBrainshot(path: args.count > i + 1 ? args[i + 1] : "brain.png",
+                 wholeBrain: args.contains("--fullbrain"))
     exit(0)
 }
 if args.contains("--simtest") {

@@ -6,8 +6,14 @@ import Cocoa
 import SceneKit
 import simd
 
+// `additive`: true glows (colors of overlapping points sum, no depth test) —
+// right for sparse clouds and bright markers, but at whole-brain density the
+// optic lobes alone (77,873 of 139,255 neurons) saturate straight to white
+// and erase the exact structure it's meant to show. false gives normal
+// depth-tested alpha blending instead, so dense regions occlude properly and
+// read as an actual 3D shape.
 private func pointCloud(positions: [SIMD3<Float>], colors: [SIMD4<Float>],
-                        rMin: CGFloat, rMax: CGFloat) -> SCNGeometry {
+                        rMin: CGFloat, rMax: CGFloat, additive: Bool = true) -> SCNGeometry {
     let vData = positions.withUnsafeBufferPointer { Data(buffer: $0) }
     let vSrc = SCNGeometrySource(data: vData, semantic: .vertex,
                                  vectorCount: positions.count, usesFloatComponents: true,
@@ -28,14 +34,21 @@ private func pointCloud(positions: [SIMD3<Float>], colors: [SIMD4<Float>],
     let g = SCNGeometry(sources: [vSrc, cSrc], elements: [elem])
     let m = SCNMaterial()
     m.lightingModel = .constant
-    m.blendMode = .add
-    m.writesToDepthBuffer = false
-    m.readsFromDepthBuffer = false
+    if additive {
+        m.blendMode = .add
+        m.writesToDepthBuffer = false
+        m.readsFromDepthBuffer = false
+    } else {
+        m.blendMode = .alpha
+        m.writesToDepthBuffer = true
+        m.readsFromDepthBuffer = true
+    }
     g.materials = [m]
     return g
 }
 
-// super_class palette (index order from etl.py)
+// super_class palette (index order from etl.py's 9-class list, used for the
+// legacy 23k-point ambient cloud in circuit mode)
 private let CLASS_COLORS: [SIMD4<Float>] = [
     SIMD4(0.16, 0.22, 0.34, 1),   // optic — dim blue (majority, keep subtle)
     SIMD4(0.45, 0.33, 0.16, 1),   // central — amber
@@ -48,6 +61,40 @@ private let CLASS_COLORS: [SIMD4<Float>] = [
     SIMD4(0.50, 0.25, 0.40, 1),   // endocrine — pink
 ]
 
+// Same palette keyed by name (fullbrain.bin's 10-class list, one more entry
+// than the legacy cloud above: sensory_ascending). Used to color the ~86% of
+// whole-brain neurons that aren't in a named command population, so the
+// point cloud reads as real anatomy (optic lobes, central brain, ...)
+// instead of a flat gray mass.
+private let SC_COLOR: [String: SIMD4<Float>] = [
+    "optic": SIMD4(0.16, 0.22, 0.34, 1),
+    "central": SIMD4(0.45, 0.33, 0.16, 1),
+    "sensory": SIMD4(0.14, 0.36, 0.34, 1),
+    "visual_projection": SIMD4(0.10, 0.48, 0.62, 1),
+    "visual_centrifugal": SIMD4(0.38, 0.22, 0.55, 1),
+    "descending": SIMD4(0.62, 0.28, 0.10, 1),
+    "ascending": SIMD4(0.20, 0.45, 0.18, 1),
+    "motor": SIMD4(0.55, 0.14, 0.14, 1),
+    "endocrine": SIMD4(0.50, 0.25, 0.40, 1),
+    "sensory_ascending": SIMD4(0.20, 0.40, 0.30, 1),
+]
+
+// Bright signature color for a named command/sensory population, or nil for
+// unclassified ("other") neurons. Shared by the circuit-overlay pass and the
+// whole-brain bulk pass so both modes use identical role colors.
+private func roleColor(_ role: String) -> SIMD4<Float>? {
+    switch role {
+    case "lc4", "lplc2": return SIMD4(0.15, 0.85, 1.0, 1)
+    case "dna01", "dna02": return SIMD4(1.0, 0.55, 0.10, 1)
+    case "mdn": return SIMD4(1.0, 0.20, 0.80, 1)
+    case "dnp09": return SIMD4(0.25, 1.0, 0.35, 1)
+    case "dng11": return SIMD4(0.75, 0.55, 1.0, 1)
+    case "escw": return SIMD4(1.0, 0.35, 0.25, 1)
+    case "gf": return SIMD4(1.0, 0.95, 0.4, 1)
+    default: return nil
+    }
+}
+
 struct BrainScene {
     let scene: SCNScene
     let cameraNode: SCNNode
@@ -55,41 +102,70 @@ struct BrainScene {
     let flashPool: [SCNNode]
 }
 
-func buildBrainScene(points: BrainPointsFile, sim: LIFSim) -> BrainScene {
+func buildBrainScene(points: BrainPointsFile?, sim: LIFSim, wholeBrain: Bool) -> BrainScene {
     let scene = SCNScene()
     scene.background.contents = NSColor(calibratedRed: 0.03, green: 0.035, blue: 0.06, alpha: 1)
 
     let group = SCNNode()
     scene.rootNode.addChildNode(group)
 
-    // full brain: 23k real somas
-    var pts: [SIMD3<Float>] = []
-    var cols: [SIMD4<Float>] = []
-    pts.reserveCapacity(points.points.count)
-    for p in points.points where p.count >= 4 {
-        pts.append(SIMD3(p[0], p[1], p[2]))
-        let ci = Int(p[3])
-        cols.append(ci < CLASS_COLORS.count ? CLASS_COLORS[ci] : SIMD4(0.3, 0.3, 0.3, 1))
-    }
-    group.addChildNode(SCNNode(geometry: pointCloud(positions: pts, colors: cols, rMin: 0.7, rMax: 1.6)))
-
-    // circuit overlay: brighter points at the 652 simulated neurons
-    var cpts: [SIMD3<Float>] = []
-    var ccols: [SIMD4<Float>] = []
-    for i in 0..<sim.n {
-        cpts.append(sim.positions[i])
-        switch sim.roles[i] {
-        case "lc4", "lplc2":  ccols.append(SIMD4(0.15, 0.85, 1.0, 1))
-        case "dna01", "dna02": ccols.append(SIMD4(1.0, 0.55, 0.10, 1))
-        case "mdn":           ccols.append(SIMD4(1.0, 0.20, 0.80, 1))
-        case "dnp09":         ccols.append(SIMD4(0.25, 1.0, 0.35, 1))
-        case "dng11":         ccols.append(SIMD4(0.75, 0.55, 1.0, 1))
-        case "escw":          ccols.append(SIMD4(1.0, 0.35, 0.25, 1))
-        case "gf":            ccols.append(SIMD4(1.0, 0.95, 0.4, 1))
-        default:              ccols.append(SIMD4(0.45, 0.45, 0.50, 1))
+    if wholeBrain {
+        // Whole-brain mode: render every one of sim.n simulated neurons —
+        // this IS the network actually running, not a separately-sampled
+        // decoration. Earlier this used the old 668-circuit era's 23k-point
+        // brain_points.json as ambient background, which is a different,
+        // unrelated point set: the view looked "full" but wasn't showing the
+        // brain that was actually computing. Named command populations get
+        // their bright signature color; the ~86% "other" bulk is colored by
+        // real super_class (sim.types) instead of flat gray, so anatomy
+        // (optic lobes, central brain, ...) is visible.
+        var pts: [SIMD3<Float>] = []
+        var cols: [SIMD4<Float>] = []
+        pts.reserveCapacity(sim.n)
+        cols.reserveCapacity(sim.n)
+        for i in 0..<sim.n {
+            pts.append(sim.positions[i])
+            cols.append(roleColor(sim.roles[i]) ?? SC_COLOR[sim.types[i]] ?? SIMD4(0.3, 0.3, 0.3, 1))
         }
+        group.addChildNode(SCNNode(geometry: pointCloud(positions: pts, colors: cols,
+                                                        rMin: 0.6, rMax: 1.5, additive: false)))
+
+        // named populations get a second, brighter/bigger pass so they don't
+        // get lost in 139k points (cheap: these lists are a few hundred long).
+        // additive here is fine — these are a few hundred sparse markers.
+        let named = sim.loomLeft + sim.loomRight + sim.gf + sim.dnaL + sim.dnaR
+                  + sim.mdn + sim.fwd + sim.groom + sim.escw
+        if !named.isEmpty {
+            var npts: [SIMD3<Float>] = []
+            var ncols: [SIMD4<Float>] = []
+            for i in named {
+                npts.append(sim.positions[i])
+                ncols.append(roleColor(sim.roles[i]) ?? SIMD4(0.8, 0.8, 0.8, 1))
+            }
+            group.addChildNode(SCNNode(geometry: pointCloud(positions: npts, colors: ncols, rMin: 1.8, rMax: 2.8)))
+        }
+    } else {
+        // circuit mode: 23k-point real-soma ambient cloud + bright overlay
+        // at the ~668 simulated neurons, unchanged from the original design
+        guard let points = points else { fatalError("circuit mode needs brain_points.json") }
+        var pts: [SIMD3<Float>] = []
+        var cols: [SIMD4<Float>] = []
+        pts.reserveCapacity(points.points.count)
+        for p in points.points where p.count >= 4 {
+            pts.append(SIMD3(p[0], p[1], p[2]))
+            let ci = Int(p[3])
+            cols.append(ci < CLASS_COLORS.count ? CLASS_COLORS[ci] : SIMD4(0.3, 0.3, 0.3, 1))
+        }
+        group.addChildNode(SCNNode(geometry: pointCloud(positions: pts, colors: cols, rMin: 0.7, rMax: 1.6)))
+
+        var cpts: [SIMD3<Float>] = []
+        var ccols: [SIMD4<Float>] = []
+        for i in 0..<sim.n {
+            cpts.append(sim.positions[i])
+            ccols.append(roleColor(sim.roles[i]) ?? SIMD4(0.45, 0.45, 0.50, 1))
+        }
+        group.addChildNode(SCNNode(geometry: pointCloud(positions: cpts, colors: ccols, rMin: 1.6, rMax: 2.6)))
     }
-    group.addChildNode(SCNNode(geometry: pointCloud(positions: cpts, colors: ccols, rMin: 1.6, rMax: 2.6)))
 
     // the two giant fibers get actual glowing markers
     for i in 0..<sim.n where sim.roles[i] == "gf" {
@@ -169,11 +245,22 @@ final class BrainRenderDriver: NSObject, SCNSceneRendererDelegate {
     }
 }
 
-// SCNView that reports clicks and hover state without needing key focus.
+// SCNView that reports clicks, drag-to-orbit, scroll/pinch-to-zoom, and hover
+// state without needing key focus. A mouseDown only becomes a "click" (stim)
+// if the pointer never travels past a small threshold before mouseUp;
+// anything past that is reported as a rotate drag instead, so orbiting the
+// view and stimulating a region share the same button without conflict.
 final class BrainSCNView: SCNView {
     var onClick: ((NSPoint) -> Void)?
     var onHover: ((Bool) -> Void)?
+    var onRotateDelta: ((CGFloat, CGFloat) -> Void)?   // (dx, dy) in points
+    var onZoomDelta: ((CGFloat) -> Void)?              // +out / -in
+    var onInteractionBegan: (() -> Void)?              // first real drag/zoom
     private var tracking: NSTrackingArea?
+    private var dragStart: NSPoint = .zero
+    private var lastDrag: NSPoint = .zero
+    private var isDragging = false
+    private let clickThreshold: CGFloat = 3
 
     override func updateTrackingAreas() {
         if let t = tracking { removeTrackingArea(t) }
@@ -185,8 +272,36 @@ final class BrainSCNView: SCNView {
         super.updateTrackingAreas()
     }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func mouseDown(with event: NSEvent) {
-        onClick?(convert(event.locationInWindow, from: nil))
+        dragStart = convert(event.locationInWindow, from: nil)
+        lastDrag = dragStart
+        isDragging = false
+    }
+    override func mouseDragged(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        if !isDragging {
+            let moved = hypot(p.x - dragStart.x, p.y - dragStart.y)
+            if moved < clickThreshold { return }
+            isDragging = true
+            onInteractionBegan?()
+        }
+        onRotateDelta?(p.x - lastDrag.x, p.y - lastDrag.y)
+        lastDrag = p
+    }
+    override func mouseUp(with event: NSEvent) {
+        if !isDragging {
+            onClick?(convert(event.locationInWindow, from: nil))
+        }
+        isDragging = false
+    }
+    override func scrollWheel(with event: NSEvent) {
+        onInteractionBegan?()
+        onZoomDelta?(-(event.scrollingDeltaY) * 0.06)
+    }
+    override func magnify(with event: NSEvent) {
+        onInteractionBegan?()
+        onZoomDelta?(-CGFloat(event.magnification) * 14)
     }
     override func mouseEntered(with event: NSEvent) { onHover?(true) }
     override func mouseExited(with event: NSEvent) { onHover?(false) }
@@ -197,12 +312,21 @@ final class BrainWindowController {
     let driver: BrainRenderDriver
     private let sim: LIFSim
     private let brainGroup: SCNNode
+    private let cameraNode: SCNNode
     private let view: BrainSCNView
     private let stimRing: SCNNode
     private let label = NSTextField(labelWithString: "")
     private var labelHider: DispatchWorkItem?
 
-    init(points: BrainPointsFile, sim: LIFSim, screen: NSScreen) {
+    // manual orbit/zoom state — see BrainSCNView's rotate/zoom callbacks
+    private var yaw: Float = 0
+    private var pitch: Float = -0.15
+    private var distance: CGFloat = 29
+    private let minDistance: CGFloat = 7
+    private let maxDistance: CGFloat = 70
+    private let maxPitch: Float = 1.4
+
+    init(points: BrainPointsFile?, sim: LIFSim, wholeBrain: Bool, screen: NSScreen) {
         self.sim = sim
         let size = NSSize(width: 340, height: 280)
         let vis = screen.visibleFrame
@@ -210,7 +334,8 @@ final class BrainWindowController {
         panel = NSPanel(contentRect: NSRect(origin: origin, size: size),
                         styleMask: [.titled, .closable, .utilityWindow, .nonactivatingPanel],
                         backing: .buffered, defer: false)
-        panel.title = "Fly Brain — FlyWire v783 (click = stimulate)"
+        panel.title = "Fly Brain — FlyWire v783\(wholeBrain ? " · WHOLE BRAIN" : "")"
+                    + " (click = stimulate, drag = rotate, scroll = zoom)"
         panel.level = .floating
         panel.isFloatingPanel = true
         panel.becomesKeyOnlyIfNeeded = true
@@ -218,8 +343,9 @@ final class BrainWindowController {
         panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.canJoinAllSpaces]
 
-        let bs = buildBrainScene(points: points, sim: sim)
+        let bs = buildBrainScene(points: points, sim: sim, wholeBrain: wholeBrain)
         brainGroup = bs.brainGroup
+        cameraNode = bs.cameraNode
         driver = BrainRenderDriver(sim: sim, flashPool: bs.flashPool)
 
         // reusable stimulation ring
@@ -259,6 +385,24 @@ final class BrainWindowController {
             self?.brainGroup.isPaused = hovering   // hold the rotation while aiming
         }
         view.onClick = { [weak self] p in self?.handleClick(at: p) }
+
+        // manual orbit: yaw/pitch straight into the group's Euler angles.
+        // zoom: dolly the camera along its own local z, clamped so it never
+        // crosses into the point cloud or drifts off into the void.
+        view.onInteractionBegan = { [weak self] in
+            self?.brainGroup.removeAllActions()   // ambient auto-spin yields to manual control, for good
+        }
+        view.onRotateDelta = { [weak self] dx, dy in
+            guard let self = self else { return }
+            self.yaw += Float(dx) * 0.010
+            self.pitch = max(-self.maxPitch, min(self.maxPitch, self.pitch + Float(dy) * 0.010))
+            self.brainGroup.eulerAngles = SCNVector3(self.pitch, self.yaw, 0)
+        }
+        view.onZoomDelta = { [weak self] d in
+            guard let self = self else { return }
+            self.distance = max(self.minDistance, min(self.maxDistance, self.distance + d))
+            self.cameraNode.position.z = self.distance
+        }
     }
 
     private func handleClick(at p: NSPoint) {
