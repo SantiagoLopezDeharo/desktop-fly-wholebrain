@@ -15,7 +15,36 @@ SceneKit; the brain data is real.
 | `BrainView.swift` | brain window: point clouds, click-to-stimulate, spike flashes |
 | `Environment.swift` | permission-free senses: `WindowSense` (ledges/looms), circadian curve, user idle, thermal tempo |
 | `etl.py` | raw Codex dumps → `data/brain_points.json` + `data/circuit.json` |
+| `etl_fullbrain.py` | raw Codex dumps → `data/fullbrain.bin` (whole brain, binary CSR) |
 | `data/` | shipped derived data (CC BY-NC 4.0 — see `data/DATA_LICENSE.md`) |
+| `docs/WHOLE_BRAIN_ROADMAP.md` | whole-brain scale-up: measurements, what's done, what's left |
+
+## Two brains
+
+The app runs **either** the curated 668-neuron circuit (default) **or** the
+whole FlyWire v783 brain (`--fullbrain`): 139,255 neurons / 2,700,513 edges.
+
+```sh
+python3 etl_fullbrain.py <raw_dir>   # build data/fullbrain.bin (~24 MB, gitignored)
+./DesktopFly --fullbrain             # live fly driven by the whole brain
+./DesktopFly --brainbench            # whole-brain speed + stability + body coupling
+```
+
+Whole-brain specifics, all in `Sim.swift`:
+- `LIFSim(fullBrain:)` is a separate init from `LIFSim(circuit:)`. **Changes to
+  one do not apply to the other** — the 668 path is tuned and must stay put.
+- Command-DN baselines are `0.004` here, not `0.036`. The circuit needed the
+  large value because the excerpt carried almost no drive onto those DNs; the
+  whole brain delivers 2.7k–23.8k synapses each, so the old value pins every
+  command on permanently.
+- **Homeostasis is a modeling choice, not connectome data**: a global gain
+  holds the population at ~5 Hz, and `tunePop` nudges each command DN toward a
+  target resting rate. Without them the network has no usable operating point.
+  Say so in any writeup — it is the least "the data did it" part of the system.
+- The whole brain runs on its own thread (`SimRunner` in `main.swift`) because
+  a step costs ~3 ms per simulated ms. It falls behind gracefully (brain in
+  slow motion) rather than spiralling; it does **not** hit 1 kHz realtime on
+  4-core Intel.
 
 ## Build, run, verify
 
@@ -29,6 +58,10 @@ SceneKit; the brain data is real.
 ```
 
 Always run **both** suites after any change; they are the ground truth.
+Two `--behaviortest` scenarios ("DNp09 stim -> walks", "ledge attach") are
+inherently flaky at **~3/25 runs** — measured on both the pre-whole-brain
+commit and after. Don't chase a single red run; take a 25-run sample before
+concluding you broke something.
 Key invariants: GF silent over 4 s of rest, GF fires ≤ ~10 ms after abrupt
 loom, walk-drive duty 20–50%, siesta (scale 0.84) walk-drive > 3%,
 no per-frame scale/z snap at landing.

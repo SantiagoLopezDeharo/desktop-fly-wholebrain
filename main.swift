@@ -482,6 +482,86 @@ final class SignalBuilder {
     }
 }
 
+// Runs a whole-brain sim on its own thread. At 139k neurons a step costs ~3 ms
+// per simulated ms, so stepping inline in the render callback would collapse
+// the frame rate. Only sensory inputs (in) and BrainSignals (out) cross the
+// boundary; both directions are lock-guarded.
+final class SimRunner {
+    let sim: LIFSim
+    private let lock = NSLock()
+    private let builder = SignalBuilder()
+
+    private var inLoomL: Float = 0, inLoomR: Float = 0, inAirPuff: Float = 0
+    private var inGaitDrive: Float = 0, inGaitPhase: Float = 0
+    private var inActivity: Float = 1, inSensoryGate: Float = 1
+
+    private var latest = BrainSignals()
+    private var escapeLatched = false
+    private var stopped = false
+    private(set) var simSpeed: Double = 0   // simulated ms per wall ms
+
+    init(sim: LIFSim) { self.sim = sim }
+
+    func setInputs(loomL: Float, loomR: Float, airPuff: Float, gaitDrive: Float,
+                   gaitPhase: Float, activityScale: Float, sensoryGate: Float) {
+        lock.lock()
+        inLoomL = loomL; inLoomR = loomR; inAirPuff = airPuff
+        inGaitDrive = gaitDrive; inGaitPhase = gaitPhase
+        inActivity = activityScale; inSensoryGate = sensoryGate
+        lock.unlock()
+    }
+
+    // Escape is latched, so a giant-fiber spike is never dropped between frames.
+    func takeSignals() -> BrainSignals {
+        lock.lock(); defer { lock.unlock() }
+        var s = latest
+        s.escape = escapeLatched
+        escapeLatched = false
+        return s
+    }
+
+    func start() {
+        let t = Thread { [self] in run() }
+        t.name = "desktopfly.wholebrain"
+        t.qualityOfService = .userInitiated
+        t.start()
+    }
+
+    func stop() { lock.lock(); stopped = true; lock.unlock() }
+
+    private func run() {
+        var last = DispatchTime.now().uptimeNanoseconds
+        var carry = 0.0
+        while true {
+            lock.lock()
+            if stopped { lock.unlock(); return }
+            sim.loomL = inLoomL; sim.loomR = inLoomR; sim.airPuff = inAirPuff
+            sim.gaitDrive = inGaitDrive; sim.gaitPhase = inGaitPhase
+            sim.activityScale = inActivity; sim.sensoryGate = inSensoryGate
+            lock.unlock()
+
+            let now = DispatchTime.now().uptimeNanoseconds
+            let dtMs = Double(now &- last) / 1e6
+            last = now
+            // If the machine cannot hold 1 kHz, fall behind gracefully (run the
+            // brain in slow motion) rather than spiral on an unbounded backlog.
+            carry = min(carry + dtMs, 50)
+            let steps = min(25, Int(carry))
+            carry -= Double(steps)
+            if steps > 0 {
+                sim.step(steps)
+                let s = builder.make(sim, dt: CGFloat(dtMs / 1000))
+                lock.lock()
+                if s.escape { escapeLatched = true }
+                latest = s
+                simSpeed = Double(steps) / max(0.001, dtMs)
+                lock.unlock()
+            }
+            usleep(1500)
+        }
+    }
+}
+
 // MARK: - Coordinator
 
 final class Coordinator: NSObject, SCNSceneRendererDelegate {
@@ -494,6 +574,7 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
     private var pending: [(Coordinator) -> Void] = []
 
     let sim: LIFSim?
+    let runner: SimRunner?          // non-nil in whole-brain mode
     private let fpsLog = ProcessInfo.processInfo.environment["DESKTOPFLY_FPS"] != nil
     private var fpsFrames = 0
     private var fpsWindowStart: TimeInterval = 0
@@ -513,9 +594,10 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
     private var windowLoomR: Float = 0
     private(set) var lastFlyPos = CGPoint.zero
 
-    init(bounds: CGSize, sim: LIFSim?) {
+    init(bounds: CGSize, sim: LIFSim?, runner: SimRunner? = nil) {
         self.bounds = bounds
         self.sim = sim
+        self.runner = runner
         self.scene = buildScene(bounds: bounds)
         super.init()
         enqueue { $0.addFlyNow() }
@@ -655,24 +737,40 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
             let decayF = Float(exp(-4 * Double(dt)))
             windowLoomL *= decayF
             windowLoomR *= decayF
-            sim.loomL = max(sensory.l, windowLoomL)
-            sim.loomR = max(sensory.r, windowLoomR)
-            sim.airPuff = max(sensory.puff, Float(typingLevel * 0.30))
+            let loomL = max(sensory.l, windowLoomL)
+            let loomR = max(sensory.r, windowLoomR)
+            let puff = max(sensory.puff, Float(typingLevel * 0.30))
             // body -> brain: leg proprioception from the current gait
-            sim.gaitDrive = Float(first.walkingIntensity)
-            sim.gaitPhase = Float(first.gaitPhasePublic)
+            let gaitDrive = Float(first.walkingIntensity)
+            let gaitPhase = Float(first.gaitPhasePublic)
             // circadian + sleep neuromodulation. Compressed: the LIF neurons sit
             // just below threshold, so a raw multiplier silences them entirely —
             // siesta should mean "less active", not comatose.
-            sim.activityScale = (1 - (1 - activity) * 0.35) * (sleepy ? 0.75 : 1)
-            sim.sensoryGate = sleepy ? 0.55 : 1
+            let act = (1 - (1 - activity) * 0.35) * (sleepy ? 0.75 : 1)
+            let gate: Float = sleepy ? 0.55 : 1
             loomOverride = max(0, loomOverride - dt * 1.2)   // override decays
-            msAccumulator += Double(dt) * 1000
-            let steps = min(50, Int(msAccumulator))
-            msAccumulator -= Double(steps)
-            sim.step(steps)
 
-            var s = signalBuilder.make(sim, dt: dt)
+            var s: BrainSignals
+            if let runner = runner {
+                // whole brain: stepped on its own thread, we just exchange values
+                runner.setInputs(loomL: loomL, loomR: loomR, airPuff: puff,
+                                 gaitDrive: gaitDrive, gaitPhase: gaitPhase,
+                                 activityScale: act, sensoryGate: gate)
+                s = runner.takeSignals()
+            } else {
+                sim.loomL = loomL
+                sim.loomR = loomR
+                sim.airPuff = puff
+                sim.gaitDrive = gaitDrive
+                sim.gaitPhase = gaitPhase
+                sim.activityScale = act
+                sim.sensoryGate = gate
+                msAccumulator += Double(dt) * 1000
+                let steps = min(50, Int(msAccumulator))
+                msAccumulator -= Double(steps)
+                sim.step(steps)
+                s = signalBuilder.make(sim, dt: dt)
+            }
             s.tempo = tempo
             s.sleep = sleepy
             signals = s
@@ -717,15 +815,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         screenFrame = frame
 
         var sim: LIFSim? = nil
+        var runner: SimRunner? = nil
         let spikeBus = SpikeBus()
         var brainPoints: BrainPointsFile? = nil
-        if let data = loadBrainData() {
-            sim = LIFSim(circuit: data.circuit, spikeBus: spikeBus)
-            brainPoints = data.points
-            dataInfo = "FlyWire v783 · \(data.points.points.count) somas · circuit \(data.circuit.neurons.count)n/\(data.circuit.edges.count)e"
+        let wholeBrain = CommandLine.arguments.contains("--fullbrain")
+
+        if wholeBrain, let fb = loadFullBrain() {
+            let s = LIFSim(fullBrain: fb, spikeBus: spikeBus)
+            sim = s
+            runner = SimRunner(sim: s)
+            brainPoints = loadBrainData()?.points
+            dataInfo = "FlyWire v783 · WHOLE BRAIN · \(fb.n)n/\(fb.colIdx.count)e"
+        } else {
+            if wholeBrain {
+                fputs("no data/fullbrain.bin — run: python3 etl_fullbrain.py <raw_dir>\n"
+                      + "falling back to the 668-neuron circuit\n", stderr)
+            }
+            if let data = loadBrainData() {
+                sim = LIFSim(circuit: data.circuit, spikeBus: spikeBus)
+                brainPoints = data.points
+                dataInfo = "FlyWire v783 · \(data.points.points.count) somas · circuit \(data.circuit.neurons.count)n/\(data.circuit.edges.count)e"
+            }
         }
 
-        coordinator = Coordinator(bounds: frame.size, sim: sim)
+        coordinator = Coordinator(bounds: frame.size, sim: sim, runner: runner)
+        runner?.start()
 
         window = NSWindow(contentRect: frame, styleMask: [.borderless],
                           backing: .buffered, defer: false)
@@ -871,7 +985,130 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
 // MARK: - Entry point
 
+// Whole-brain harness: load data/fullbrain.bin, report speed against the 1 kHz
+// realtime budget, and check the network is neither seizing nor silent.
+func runBrainBench() {
+    guard let fb = loadFullBrain() else {
+        fputs("no data/fullbrain.bin — run: python3 etl_fullbrain.py <raw_dir>\n", stderr)
+        exit(1)
+    }
+    print("fullbrain.bin: \(fb.n) neurons, \(fb.colIdx.count) edges, "
+          + "mean out-degree \(String(format: "%.1f", Float(fb.colIdx.count) / Float(fb.n)))")
+
+    var t = Date()
+    let sim = LIFSim(fullBrain: fb, spikeBus: nil)
+    print(String(format: "LIFSim init: %.2fs", -t.timeIntervalSinceNow))
+    print("groups | loom L/R: \(sim.loomLeft.count)/\(sim.loomRight.count) | GF: \(sim.gf.count)"
+          + " | DNa L/R: \(sim.dnaL.count)/\(sim.dnaR.count) | MDN: \(sim.mdn.count)"
+          + " | DNp09: \(sim.fwd.count) | DNg11: \(sim.groom.count) | escW: \(sim.escw.count)"
+          + " | ascend: \(sim.ascend.count) | sens: \(sim.sens.count)")
+
+    // let homeostasis settle, reporting as it converges
+    print("\n--- settling (homeostatic gain seeking \(sim.homeoTargetHz) Hz) ---")
+    for s in 1...15 {
+        t = Date()
+        sim.step(1000)
+        let el = -t.timeIntervalSinceNow
+        print(String(format: "  t=%ds  pop %5.2f Hz  gain %.3f  |  %.2f ms wall per sim-ms",
+                     s, sim.ratePop, sim.homeoGain, el * 1000 / 1000))
+    }
+
+    let settled = sim.ratePop
+    print("\n--- stability ---")
+    var minR = Float.greatestFiniteMagnitude, maxR: Float = 0
+    for _ in 0..<10 {
+        sim.step(500)
+        minR = min(minR, sim.ratePop); maxR = max(maxR, sim.ratePop)
+    }
+    print(String(format: "  5s steady state: pop %.2f Hz (min %.2f, max %.2f), gain %.3f",
+                 sim.ratePop, minR, maxR, sim.homeoGain))
+    let alive = sim.ratePop > 0.2 && sim.ratePop < 100
+    let stable = maxR < minR * 6 + 1
+    print("  alive (0.2-100 Hz): \(alive ? "PASS" : "FAIL")")
+    print("  no seizure/collapse: \(stable ? "PASS" : "FAIL")")
+
+    print("\n--- escape: abrupt loom -> giant fiber ---")
+    _ = sim.consumeGF()
+    sim.loomL = 1.0; sim.loomR = 1.0
+    var gfMs = -1
+    for ms in 0..<400 {
+        sim.step(1)
+        if sim.consumeGF() { gfMs = ms; break }
+    }
+    sim.loomL = 0; sim.loomR = 0
+    print("  LC rate \(String(format: "%.1f", sim.rateLoom)) Hz, GF first spike at "
+          + (gfMs >= 0 ? "\(gfMs) ms" : "NEVER"))
+    print("  GF responds to loom: \((gfMs >= 0 && gfMs <= 60) ? "PASS" : "FAIL")")
+
+    sim.step(500)
+    print("\n--- descending command rates at rest ---")
+    print(String(format: "  DNa L/R %.1f/%.1f Hz | DNp09 %.1f Hz | DNg11 %.1f Hz | MDN %.1f Hz | escW %.1f Hz",
+                 sim.rateDNaL, sim.rateDNaR, sim.rateFwd, sim.rateGroom, sim.rateMDN, sim.rateEscW))
+
+    print(String(format: "\nrealtime budget: need <=1.00 ms wall per sim-ms; settled pop %.2f Hz", settled))
+
+    // --- does the whole brain actually drive the body? ---
+    // Same coupling the app uses: sim rates -> SignalBuilder -> Fly.update.
+    print("\n--- whole brain -> body ---")
+    let builder = SignalBuilder()
+    let bounds = CGSize(width: 1512, height: 982)
+    let dt: CGFloat = 1.0 / 60.0
+    var failures = 0
+
+    func scenario(_ name: String, stim: (LIFSim) -> Void, hold: CGFloat,
+                  setup: ((Fly) -> Void)? = nil,
+                  check: (Fly) -> Bool, describe: (Fly) -> String) {
+        let fly = Fly(at: .zero)
+        fly.state = .idle
+        fly.speed = 0
+        setup?(fly)
+        sim.step(600)                    // rest between scenarios
+        _ = sim.consumeGF()
+        stim(sim)
+        var passed = false
+        var frames = Int(hold / dt)
+        while frames > 0 {
+            frames -= 1
+            sim.step(Int((dt * 1000).rounded()))
+            let s = builder.make(sim, dt: dt)
+            fly.update(dt: dt, bounds: bounds, mouse: nil, signals: s)
+            if check(fly) { passed = true; break }
+        }
+        if !passed { failures += 1 }
+        print("  \(passed ? "PASS" : "FAIL")  \(name): \(describe(fly))")
+    }
+
+    scenario("GF stim -> escape flight",
+             stim: { $0.stimulate($0.gf, strength: 0.5, durationMs: 40) }, hold: 0.5,
+             check: { $0.state == .flying }, describe: { "state=\($0.state)" })
+
+    scenario("DNg11 stim -> grooming",
+             stim: { $0.stimulate($0.groom, strength: 0.25, durationMs: 600) }, hold: 1.5,
+             check: { $0.state == .grooming }, describe: { "state=\($0.state)" })
+
+    scenario("DNp09 stim -> walking",
+             stim: { $0.stimulate($0.fwd, strength: 0.25, durationMs: 900) }, hold: 2.0,
+             check: { $0.state == .walking }, describe: { "state=\($0.state)" })
+
+    scenario("MDN stim -> backward walking",
+             stim: { $0.stimulate($0.mdn, strength: 0.30, durationMs: 700) }, hold: 2.0,
+             check: { $0.backwardTimer > 0 },
+             describe: { "backwardTimer=\(String(format: "%.2f", $0.backwardTimer))" })
+
+    scenario("abrupt loom -> takeoff",
+             stim: { $0.loomL = 1.0; $0.loomR = 1.0 }, hold: 0.6,
+             check: { $0.state == .flying }, describe: { "state=\($0.state)" })
+    sim.loomL = 0; sim.loomR = 0
+
+    print(failures == 0 ? "\nWHOLE BRAIN DRIVES THE BODY: all scenarios pass"
+                        : "\n\(failures) scenario(s) failed")
+}
+
 let args = CommandLine.arguments
+if args.contains("--brainbench") {
+    runBrainBench()
+    exit(0)
+}
 if let i = args.firstIndex(of: "--snapshot") {
     runSnapshot(path: args.count > i + 1 ? args[i + 1] : "preview.png")
     exit(0)

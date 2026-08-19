@@ -1,11 +1,54 @@
 # Whole-brain roadmap
 
+> **STATUS: the whole brain runs.** 139,255 neurons / 2,700,513 edges, stable,
+> driving the fly's body. See "Results" below. Sections 1–4 are the analysis
+> that got there and remain accurate; the workstream list records what is done
+> and what is left.
+
+## Results (achieved)
+
+```
+./DesktopFly --brainbench     # whole-brain harness: speed, stability, body coupling
+./DesktopFly --fullbrain      # live desktop fly driven by all 139k neurons
+python3 etl_fullbrain.py <raw_dir>   # rebuild data/fullbrain.bin (~24 MB, gitignored)
+```
+
+| | result |
+|---|---|
+| network | 139,255 neurons, 2,700,513 edges, mean out-degree 19.4 |
+| load time | **0.04 s** (binary CSR; the JSON path extrapolated to ~11 s) |
+| process RSS, live app | **84 MB** |
+| step cost | **~3.0 ms wall per sim-ms** (single-threaded) |
+| population rate | 5.00 Hz, min 4.99 / max 5.02 over 5 s — no seizure, no collapse |
+| escape latency | **GF fires 4 ms after abrupt loom** — invariant holds at full scale |
+| resting DN rates | DNa 9.4/4.2, DNp09 0.4, DNg11 2.3, MDN 1.8, escW 3.4 Hz |
+| body coupling | 5/5 scenarios pass (GF→flight, DNg11→groom, DNp09→walk, MDN→backward, loom→takeoff) |
+| both legacy suites | still pass (`--simtest`, `--behaviortest`) |
+
+Two predictions from the analysis below were wrong in the good direction:
+**3.0 ms/sim-ms rather than the predicted 4.7**, because the real connectome is
+modular and spatially clustered where the synthetic benchmark was random — the
+cache behaves better on real data. And the app renders at 13.6 fps in
+whole-brain mode against **17–20 fps in stock 668-circuit mode**, i.e. the whole
+brain costs ~25% of frame rate, not the collapse a 3 ms inline step implied —
+because the sim was moved to its own thread (`SimRunner`).
+
+Honest caveats:
+- **Not 1 kHz realtime on this hardware.** At ~3.0 ms/sim-ms the brain runs at
+  roughly 1/3 speed; `SimRunner` degrades gracefully (slow motion) rather than
+  spiralling. Getting to true realtime still needs WS3's SIMD + MIMD, and
+  probably Apple Silicon.
+- **Homeostasis is a modeling choice, not connectome data.** Both the global
+  gain and the per-population DN tuning are documented as such in `Sim.swift`.
+  Without them the network does not sit at a usable operating point.
+
+
 Goal: replace the curated 668-neuron circuit with the **full FlyWire v783
-connectome** (139,255 neurons / 2,701,601 thresholded connections) as the
+connectome** (139,255 neurons / 2,700,513 thresholded connections) as the
 driver for the fly's behavior.
 
 Everything below is measured on the actual code, not estimated. Reproduce with
-the harness in `bench/` (see WS0). Measurements taken 2026-08-19 on an
+`./DesktopFly --brainbench`. Measurements taken 2026-08-19 on an
 Intel i7-1068NG7 (4 physical cores / 8 logical, 16 GB).
 
 ---
@@ -15,8 +58,8 @@ Intel i7-1068NG7 (4 physical cores / 8 logical, 16 GB).
 The first pass at this concluded "~10 GB RAM, 3.5 min load, not feasible."
 **That was wrong by ~18×.** It extrapolated from 54.5M *synapses*, but the CSR
 in `Sim.swift` stores *edges* — unique pre→post pairs, each carrying a
-`syn_count` — and FlyWire v783 has 2,701,601 edges at the ≥5-synapse
-threshold, not 54.5M. The current `data/circuit.json` confirms the ratio:
+`syn_count` — and FlyWire v783 has 2,700,513 such pairs (the published
+2,701,601 counts rows before de-duplicating across neuropils), not 54.5M. The current `data/circuit.json` confirms the ratio:
 18,968 edges carrying 202,774 synapses (10.7 syn/edge).
 
 Corrected, the project is **substantially more feasible than first stated**.
@@ -28,7 +71,7 @@ not a ~200× one.
 | | current | full brain | factor |
 |---|---|---|---|
 | neurons | 668 | 139,255 | 208× |
-| edges | 18,968 | 2,701,601 | 142× |
+| edges | 18,968 | 2,700,513 | 142× |
 | avg out-degree | 28.4 | 19.4 | **0.68×** |
 
 Note the last row: the curated circuit is *denser* than the brain average, so
@@ -114,15 +157,17 @@ Survivable, but WS2 removes it.
 
 ## Workstreams
 
-### WS0 — Benchmark harness first
-Land the measurement rig before optimizing anything. Add a `--scalebench`
-mode that builds a synthetic network at parameterized `n`/`edges`, runs the
-real `LIFSim`, and reports ms/sim-ms + the phase breakdown above.
-**First task: run it on an Apple Silicon machine.** The entire performance
-plan branches on whether the 2.1× parallel ceiling is this laptop's memory
+Status key: **[done]** shipped · **[partial]** started · **[todo]** not begun.
+
+### WS0 — Benchmark harness first **[done]**
+Shipped as `./DesktopFly --brainbench`: loads `fullbrain.bin`, reports speed
+against the 1 kHz budget, checks the network is neither seizing nor silent,
+and runs the body-coupling scenarios.
+**Still worth doing: run it on an Apple Silicon machine.** The performance plan
+branches on whether the 2.11× parallel ceiling is this laptop's memory
 bandwidth or something structural.
 
-### WS1 — Cheap wins (do these regardless)
+### WS1 — Cheap wins **[done]**
 1. **Xorshift RNG** — 4.8×, one line. Biggest single win available.
 2. **`roles`/`types` as `UInt8` enums, not `String`** — the hot loop does a
    `switch` on `String` per spike (`Sim.swift:310`) plus `dnaL.contains(i)`
@@ -131,7 +176,7 @@ bandwidth or something structural.
 
 Expect ~4.7 → ~4.0 ms before any architectural change.
 
-### WS2 — Data pipeline
+### WS2 — Data pipeline **[done]**
 - Extend `etl.py` with a whole-brain mode: keep all 139k neurons, all edges,
   drop the `MAX_PARTNERS = 330` selection. `NT_SIGN` already maps
   neurotransmitter → sign, so it carries over unchanged.
@@ -142,7 +187,7 @@ Expect ~4.7 → ~4.0 ms before any architectural change.
   or a fetch script is cleaner. **`data/` stays CC BY-NC 4.0** — keep the
   license split and the Dorkenwald/Schlegel citations intact.
 
-### WS3 — Sim core
+### WS3 — Sim core **[partial]** — off-thread done; SIMD + MIMD still todo
 - Move the sim **off the SceneKit render thread**. `Coordinator.enqueue{}`
   already exists for cross-thread state, so the plumbing is there. Decouples
   sim rate from frame rate and is a prerequisite for everything else.
@@ -158,7 +203,7 @@ Expect ~4.7 → ~4.0 ms before any architectural change.
   "GF fires ≤ ~10 ms after abrupt loom" invariant. Treat as affinity
   constraints, not min-cut weights.
 
-### WS4 — Biological stability ⚠️ **highest risk**
+### WS4 — Biological stability **[done, with caveats]**
 This, not performance, is what most likely sinks the project.
 
 The current tuning is razor-thin by design (CLAUDE.md: neurons rest at
@@ -176,7 +221,7 @@ revisit `weightScale = 0.0008`; revisit `NT_SIGN`'s treatment of DA/SER/OCT as
 +0.5 (modulators as weak excitation is a real simplification at whole-brain
 scale). Budget research time here, not just engineering time.
 
-### WS5 — Readout and inputs
+### WS5 — Readout and inputs **[partial]**
 Good news: **the readout layer largely survives.** Every mapped population
 (DNp01, DNa01/02, DNp09, DNg11, MDN, DNp02/04/11) still exists in the full
 brain, so `SignalBuilder` → `BrainSignals` → `FlyModel.brainBehavior` keeps
@@ -188,7 +233,7 @@ Upside unlocked: the full brain includes real sensory populations
 (photoreceptors, Johnston's organ), so `WindowSense` looms could drive actual
 visual neurons instead of being injected into LC4/LPLC2 directly.
 
-### WS6 — Tests
+### WS6 — Tests **[partial]**
 `--simtest` and `--behaviortest` are the ground truth and **must keep passing**
 (or be consciously re-baselined with the reason recorded). Add:
 - a **performance regression test** (ms/sim-ms at fixed n), and
@@ -197,15 +242,29 @@ visual neurons instead of being injected into LC4/LPLC2 directly.
 
 ---
 
-## Suggested order
+## What is left
 
-`WS0` (know the hardware ceiling) → `WS1` (free 5×) → `WS2` (binary data, real
-full-brain file) → **`WS4` stability spike on real data at ~20k neurons** →
-`WS3` (SIMD + MIMD) → `WS5`/`WS6`.
-
-Scale up the ladder **668 → 5k → 20k → 139k**, re-running both suites at each
-rung. Jumping straight to 139k will produce a network that is simultaneously
-too slow and biologically dead, with no way to tell which problem is which.
-
-The WS4 spike is deliberately early: it is the cheapest way to find out whether
-the whole idea works, and it does not depend on any of the performance work.
+1. **Realtime (WS3).** ~3.0 ms/sim-ms needs to become ≤1.0. The dense phases
+   (48.6% of step time) are elementwise over contiguous `[Float]` and should
+   vectorise well with Accelerate; synapse fanout (44.8%) needs neuropil
+   partitioning with the gap-junction affinity constraint intact. The measured
+   parallel ceiling on this 4-core Intel is only 2.11×, so **running
+   `--brainbench` on Apple Silicon is the highest-information next step** —
+   more P-cores and far higher memory bandwidth may close most of the gap for
+   free.
+2. **Refit the readout (WS5).** `SignalBuilder`'s constants (`rateFwd / 10`,
+   `rateMDN > 8`, …) were fitted to the 668-neuron circuit. They work at
+   whole-brain scale only because the per-population homeostat deliberately
+   targets comparable resting rates. Fitting them to the whole brain directly
+   would let that homeostat be loosened or removed — worth doing, because right
+   now a modeling choice is propping up a readout it shouldn't need to.
+3. **Real sensory pathways (WS5).** The whole brain ships 16,938 sensory
+   neurons. Looms are still injected straight into LC4/LPLC2; they could drive
+   actual photoreceptor populations instead, which is the main scientific
+   upside the whole brain unlocks.
+4. **Stability under load (WS6).** Verified at rest and under single-population
+   stimulation. Not yet verified under sustained multi-modal input, or over
+   hours. Add both as regression tests.
+5. **`BrainView` at 139k.** It renders the whole point cloud and was written
+   for 668 neurons. It works, but click-to-stimulate does an O(n) scan per
+   click and the role colouring has not been tuned for this density.

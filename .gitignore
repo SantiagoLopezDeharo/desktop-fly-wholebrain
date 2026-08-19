@@ -3,3 +3,6 @@ DesktopFly
 *.log
 nohup.out
 /*.png
+
+# whole-brain derived data (~24 MB) — rebuild with etl_fullbrain.py
+data/fullbrain.bin
