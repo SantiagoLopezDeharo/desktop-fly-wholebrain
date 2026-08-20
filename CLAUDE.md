@@ -57,6 +57,34 @@ Whole-brain specifics, all in `Sim.swift`:
   category as how the loom pathway's own L/R injection split is computed, not
   a claim that steering itself is brain-derived. `--brainbench` probes the
   response curve and checks it doesn't leak into a false GF escape.
+- **`dnb01` (2, clean L/R) — real, live flight steering.** Bilateral activity
+  documented to explain ~90% of variance in differential wing-stroke
+  amplitude during flight saccades (Curr. Biol. 2017,
+  10.1016/j.cub.2017.02.032). Unlike every other whole-brain population,
+  **nothing injects into it** — it's driven purely by whatever the whole
+  brain naturally feeds it, and `--brainbench` shows large spontaneous L-R
+  swings (stddev ~6 Hz) with no external stimulus at all. `SignalBuilder`
+  baseline-adapts it (tau 8s, same pattern as `dnaBaseline`) into
+  `BrainSignals.flightSteerBias`, and `Fly.updateFlight` (`FlyModel.swift`)
+  uses it to nudge `flightTo` itself in real time, not just a cosmetic
+  wobble — the only place in the app where the brain genuinely decides
+  *where* the fly ends up, not just how the path looks getting there.
+  Previously flight direction was 100% fixed at takeoff.
+- **`dng12` (42, pooled) — real, distinct grooming subroutine.** DNg11 drives
+  front-leg rubbing only; DNg12 drives head sweeps targeting the antenna
+  (Curr. Biol. 2021, anterior-grooming-hierarchy paper). Also purely
+  network-driven, baseline-adapted (tau 6s) into `BrainSignals.headGroomDrive`.
+  `Fly.updateLegs` blends `model.head` sweeping in and eases the front-leg
+  animation back as DNg12 rises above its own recent norm — an emergent
+  alternation between the two real grooming populations, not a scripted one.
+- **Tried and rejected: routing food-steering through either DNa or PFL3**
+  (the literature's actual steering-decision neuron, 24 real neurons, direct
+  496-syn input to DNa02). Both measured properly (see tuning gotchas below)
+  and both failed for a genuine reason — central-complex heading is a
+  ring/population-vector code, not two lateralized pools — not a wiring bug.
+  `foodSeek`'s direction stays geometric for that reason specifically; it's
+  not for lack of trying, and don't re-attempt with the same left/right
+  framing without a real population-vector decode.
 
 ## Build, run, verify
 

@@ -510,6 +510,8 @@ func runBehaviorTest() {
 // and --behaviortest so both exercise the identical mapping.
 final class SignalBuilder {
     private var dnaBaseline: Float = 0
+    private var dnb01Baseline: Float = 0
+    private var dng12Baseline: Float = 0
 
     func make(_ sim: LIFSim, dt: CGFloat) -> BrainSignals {
         let diff = sim.rateDNaL - sim.rateDNaR
@@ -533,6 +535,25 @@ final class SignalBuilder {
         // at contact) -- 190 puts "clearly in range" around attraction 0.3
         // and saturates to 1.0 well before actual contact, not only at it
         s.foodAttraction = clampf(CGFloat(sim.rateFoodOrn) / 190, 0, 1)
+
+        // DNb01: real flight-steering command neuron, driven entirely by
+        // whatever the whole brain naturally feeds it (nothing injects into
+        // it). --brainbench sampling showed large spontaneous L-R swings
+        // (stddev ~6 Hz around a slowly-drifting mean) -- baseline-adapt the
+        // same way DNa is, so a persistent bias doesn't become a permanent
+        // turn, and only real transient asymmetry (spontaneous saccades)
+        // steers flight.
+        let b01Diff = sim.rateDNb01L - sim.rateDNb01R
+        dnb01Baseline += (b01Diff - dnb01Baseline) * Float(min(1, dt / 8))
+        s.flightSteerBias = clampf(CGFloat(b01Diff - dnb01Baseline) / 8, -1, 1)
+
+        // DNg12: real head-sweep grooming neuron, also purely network-driven.
+        // Baseline-adapted rather than a fixed scale since it has no injected
+        // drive to calibrate a ceiling against -- head-sweep emphasis kicks
+        // in only when DNg12 is genuinely elevated above its own recent norm.
+        dng12Baseline += (sim.rateDNg12 - dng12Baseline) * Float(min(1, dt / 6))
+        s.headGroomDrive = clampf(CGFloat(sim.rateDNg12 - dng12Baseline) / 1.5, 0, 1)
+
         return s
     }
 }
@@ -1213,6 +1234,29 @@ func runBrainBench() {
         && notSmelling.foodAttraction < FOOD_SMELL_THRESHOLD && gfDuringFood == 0
     print("  responds to proximity, fades when it's gone, no false escape: \(smellOK ? "PASS" : "FAIL")")
 
+    print("\n--- DNb01 (flight steering, 2 real neurons) / DNg12 (head-sweep grooming, 42 real neurons) ---")
+    print("purely network-driven -- nothing injects into either; this samples natural resting variability")
+    var b01Diffs: [Float] = [], g12Rates: [Float] = []
+    for s in 1...10 {
+        sim.step(1000)
+        let diff = sim.rateDNb01L - sim.rateDNb01R
+        b01Diffs.append(diff)
+        g12Rates.append(sim.rateDNg12)
+        print(String(format: "  t=%ds  DNb01 L/R %.2f/%.2f (diff %+.2f) | DNg12 %.2f Hz",
+                     s, sim.rateDNb01L, sim.rateDNb01R, diff, sim.rateDNg12))
+    }
+    var b01Sum: Float = 0
+    for v in b01Diffs { b01Sum += v }
+    let b01Mean: Float = b01Sum / Float(b01Diffs.count)
+    var b01SqSum: Float = 0
+    for v in b01Diffs { let d = v - b01Mean; b01SqSum += d * d }
+    let b01SD: Float = sqrt(b01SqSum / Float(b01Diffs.count))
+    var g12Sum: Float = 0
+    for v in g12Rates { g12Sum += v }
+    let g12Mean: Float = g12Sum / Float(g12Rates.count)
+    print(String(format: "  DNb01 diff: mean %+.2f Hz, stddev %.2f Hz | DNg12: mean %.2f Hz",
+                 b01Mean, b01SD, g12Mean))
+
     print(String(format: "\nrealtime budget: need <=1.00 ms wall per sim-ms; settled pop %.2f Hz", settled))
 
     // --- does the whole brain actually drive the body? ---
@@ -1291,6 +1335,52 @@ func runBrainBench() {
         sim.foodDrive = 0
         if !passed { failures += 1 }
         print("  \(passed ? "PASS" : "FAIL")  food: real ORN spiking drives approach: state=\(fly.state)")
+    }
+
+    // flight steering: DNb01 is never injected by anything else in the app,
+    // so directly stimulating one side and checking flightTo actually moves
+    // is a clean test of "the brain decides direction," not a proxy for it
+    do {
+        let fly = Fly(at: .zero)
+        fly.state = .idle
+        fly.startFlight(bounds: bounds, effort: 0.6)
+        let dx0 = fly.flightTo.x - fly.flightFrom.x, dy0 = fly.flightTo.y - fly.flightFrom.y
+        let len0 = max(1, hypot(dx0, dy0))
+        let perpX = -dy0 / len0, perpY = dx0 / len0   // steer axis, perpendicular to the original path
+        sim.step(600); _ = sim.consumeGF()
+        var frames = 0
+        var maxPerpDrift: CGFloat = 0
+        while fly.state == .flying && frames < 120 {
+            frames += 1
+            sim.stimulate(sim.dnb01L, strength: 0.6, durationMs: 20)
+            sim.step(Int((dt * 1000).rounded()))
+            let s = builder.make(sim, dt: dt)
+            fly.update(dt: dt, bounds: bounds, mouse: nil, signals: s)
+            let driftX = fly.flightTo.x - (fly.flightFrom.x + dx0)
+            let driftY = fly.flightTo.y - (fly.flightFrom.y + dy0)
+            maxPerpDrift = max(maxPerpDrift, driftX * perpX + driftY * perpY)
+        }
+        let passed = maxPerpDrift > 5   // destination genuinely moved off the original line
+        if !passed { failures += 1 }
+        print(String(format: "  %@  flight steering: DNb01-left stim shifts the actual destination: "
+                     + "perp drift %.1f pt", passed ? "PASS" : "FAIL", maxPerpDrift))
+    }
+
+    // head-sweep grooming: DNg12 is also never injected elsewhere; verify the
+    // real signal actually reaches BrainSignals.headGroomDrive
+    do {
+        let sim2 = LIFSim(fullBrain: fb, spikeBus: nil)
+        sim2.step(600)
+        let builder2 = SignalBuilder()
+        var restSum: CGFloat = 0
+        for _ in 0..<10 { sim2.step(1000); restSum += builder2.make(sim2, dt: 1.0).headGroomDrive }
+        let restAvg = restSum / 10
+        for _ in 0..<60 { sim2.stimulate(sim2.dng12, strength: 0.5, durationMs: 40); sim2.step(50) }
+        let driven = builder2.make(sim2, dt: 1.0 / 20)
+        let passed = driven.headGroomDrive > restAvg + 0.2
+        if !passed { failures += 1 }
+        print(String(format: "  %@  head-sweep grooming: DNg12 stim raises headGroomDrive: "
+                     + "rest avg %.2f -> driven %.2f", passed ? "PASS" : "FAIL", restAvg, driven.headGroomDrive))
     }
 
     print(failures == 0 ? "\nWHOLE BRAIN DRIVES THE BODY: all scenarios pass"

@@ -19,6 +19,8 @@ struct BrainSignals {
     var sleep = false           // circadian + idle -> sleep-like state
     var foodAttraction: CGFloat = 0  // food-odor ORN population rate, 0..1 (whole-brain only)
     var hasFoodSense = false         // true only when the loaded brain has food_orn neurons
+    var flightSteerBias: CGFloat = 0 // DNb01 L-R (baseline-adapted), -1..1, real mid-flight steering
+    var headGroomDrive: CGFloat = 0  // DNg12 above its own baseline, 0..1, head-sweep emphasis
 }
 
 struct BrainPointsFile: Decodable {
@@ -83,7 +85,7 @@ struct Xorshift: RandomNumberGenerator {
 // instead of a String compare. Order MUST match ROLES in etl_fullbrain.py.
 enum Role: UInt8 {
     case other = 0, lc4, lplc2, gf, dna01, dna02, dnp09, dng11, mdn, escw,
-         ascending, sensory, foodOrn
+         ascending, sensory, foodOrn, dnb01, dng12
     init?(slug: String) {
         switch slug {
         case "other": self = .other
@@ -99,6 +101,8 @@ enum Role: UInt8 {
         case "ascending": self = .ascending
         case "sensory": self = .sensory
         case "food_orn": self = .foodOrn
+        case "dnb01": self = .dnb01
+        case "dng12": self = .dng12
         default: return nil
         }
     }
@@ -117,6 +121,8 @@ enum Role: UInt8 {
         case .ascending: return "ascending"
         case .sensory: return "sensory"
         case .foodOrn: return "food_orn"
+        case .dnb01: return "dnb01"
+        case .dng12: return "dng12"
         }
     }
 }
@@ -206,6 +212,7 @@ final class LIFSim {
     let positions: [SIMD3<Float>]
     private var roleId: [UInt8]  // hot-path role lookup (integer compare)
     private var isDnaLeft: [Bool] // replaces dnaL.contains(i) linear search
+    private var isDnb01Left: [Bool] = []
 
     // LIF state
     private var v: [Float]
@@ -234,6 +241,15 @@ final class LIFSim {
     // circuit never includes these, so this stays empty there and food
     // injection below is a harmless no-op for that mode.
     private(set) var foodOrn: [Int] = []
+    // Flight-steering command neuron (real synaptic input only -- nothing
+    // injects into it; whatever the whole brain naturally drives it with is
+    // what steers flight). L/R split like dnaL/dnaR since steering needs the
+    // bilateral difference.
+    private(set) var dnb01L: [Int] = []
+    private(set) var dnb01R: [Int] = []
+    // Grooming subtype distinct from `groom` (DNg11): head sweeps vs
+    // front-leg rubbing. Pooled, not L/R split -- magnitude only, like escw.
+    private(set) var dng12: [Int] = []
     private var ascendPhase: [Float] = []  // per-ascending-neuron gait phase offset
 
     // inputs (0..1), set each frame by the coordinator
@@ -255,6 +271,9 @@ final class LIFSim {
     private(set) var rateGroom: Float = 0
     private(set) var rateEscW: Float = 0
     private(set) var rateFoodOrn: Float = 0
+    private(set) var rateDNb01L: Float = 0
+    private(set) var rateDNb01R: Float = 0
+    private(set) var rateDNg12: Float = 0
     private(set) var ratePop: Float = 0    // whole-population Hz per neuron
     private var gfLatch = false
     private(set) var simMs: Int = 0
@@ -407,6 +426,7 @@ final class LIFSim {
         roles = fb.roleId.map { (Role(rawValue: $0) ?? .other).slug }
         types = fb.superClass.map { scNames[Int($0) < scNames.count ? Int($0) : 1] }
         isDnaLeft = [Bool](repeating: false, count: n)
+        isDnb01Left = [Bool](repeating: false, count: n)
         v = [Float](repeating: 0, count: n)
         refr = [Float](repeating: 0, count: n)
         inhQueue = Array(repeating: [Float](repeating: 0, count: n), count: 5)
@@ -425,10 +445,13 @@ final class LIFSim {
             case .ascending: ascend.append(i)
             case .sensory: sens.append(i)
             case .foodOrn: foodOrn.append(i)
+            case .dnb01: if left { dnb01L.append(i) } else { dnb01R.append(i) }
+            case .dng12: dng12.append(i)
             case .other: break
             }
         }
         for i in dnaL { isDnaLeft[i] = true }
+        for i in dnb01L { isDnb01Left[i] = true }
         var phaseRng = Xorshift(seed: 0x5DEECE66D)
         ascendPhase = ascend.map { _ in Float.random(in: 0...(2 * Float.pi), using: &phaseRng) }
 
@@ -446,7 +469,7 @@ final class LIFSim {
             // almost no drive onto them (DNg11 had 6 synapses); the whole brain
             // delivers 2.7k-24k synapses each, so a baseline that size
             // double-counts and pins every command on permanently.
-            case .dna01, .dna02, .mdn, .dng11, .escw, .dnp09: base[i] = 0.004
+            case .dna01, .dna02, .mdn, .dng11, .escw, .dnp09, .dnb01, .dng12: base[i] = 0.004
             case .sensory, .foodOrn: base[i] = 0.006
             default: base[i] = Float.random(in: 0.008...0.042, using: &baseRng)
             }
@@ -550,6 +573,7 @@ final class LIFSim {
 
             // group rates (Hz per neuron, EMA)
             var cLoom = 0, cDL = 0, cDR = 0, cM = 0, cF = 0, cG = 0, cW = 0, cFO = 0
+            var cB01L = 0, cB01R = 0, cG12 = 0
             for i in spiked {
                 switch Role(rawValue: roleId[i]) ?? .other {
                 case .lc4, .lplc2: cLoom += 1
@@ -559,6 +583,8 @@ final class LIFSim {
                 case .dng11: cG += 1
                 case .escw: cW += 1
                 case .foodOrn: cFO += 1
+                case .dnb01: if isDnb01Left[i] { cB01L += 1 } else { cB01R += 1 }
+                case .dng12: cG12 += 1
                 case .gf: gfLatch = true
                 default: break
                 }
@@ -572,6 +598,9 @@ final class LIFSim {
             rateGroom += (Float(cG) * 1000 / Float(max(1, groom.count)) - rateGroom) * rateAlpha
             rateEscW += (Float(cW) * 1000 / Float(max(1, escw.count)) - rateEscW) * rateAlpha
             rateFoodOrn += (Float(cFO) * 1000 / Float(max(1, foodOrn.count)) - rateFoodOrn) * rateAlpha
+            rateDNb01L += (Float(cB01L) * 1000 / Float(max(1, dnb01L.count)) - rateDNb01L) * rateAlpha
+            rateDNb01R += (Float(cB01R) * 1000 / Float(max(1, dnb01R.count)) - rateDNb01R) * rateAlpha
+            rateDNg12 += (Float(cG12) * 1000 / Float(max(1, dng12.count)) - rateDNg12) * rateAlpha
             ratePop  += (Float(spiked.count) * 1000 / Float(max(1, n)) - ratePop) * rateAlpha
 
             if homeostasis {
@@ -587,6 +616,9 @@ final class LIFSim {
                     tunePop(groom, rateGroom, 3.0)
                     tunePop(mdn, rateMDN, 3.0)
                     tunePop(escw, rateEscW, 3.0)
+                    tunePop(dnb01L, rateDNb01L, 4.0)
+                    tunePop(dnb01R, rateDNb01R, 4.0)
+                    tunePop(dng12, rateDNg12, 3.0)
                     popTuned = true
                 }
             }

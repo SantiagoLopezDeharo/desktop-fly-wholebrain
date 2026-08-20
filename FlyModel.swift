@@ -100,6 +100,7 @@ struct FlyModel {
     let blurWingL: SCNNode
     let blurWingR: SCNNode
     let abdomen: SCNNode
+    let head: SCNNode
 }
 
 func buildLeg(attach: SCNVector3, baseYaw: CGFloat, swingSign: CGFloat, phase: CGFloat,
@@ -262,7 +263,7 @@ func buildFlyModel() -> FlyModel {
     root.addChildNode(br)
 
     return FlyModel(root: root, legs: legs, foldedWings: foldedWings,
-                    blurWingL: bl, blurWingR: br, abdomen: abdomen)
+                    blurWingL: bl, blurWingR: br, abdomen: abdomen, head: head)
 }
 
 // MARK: - Behavior
@@ -310,6 +311,10 @@ final class Fly {
     private var brainLive = false
     private var liveArousal: CGFloat = 0
     private var liveWing: CGFloat = 0
+    private var liveFlightSteer: CGFloat = 0   // DNb01 L-R, real -- steers mid-flight
+    private var liveHeadGroom: CGFloat = 0     // DNg12 above its own baseline -- head-sweep emphasis
+    private var headSweep: CGFloat = 0
+    private var headSweepTarget: CGFloat = 0
 
     init(at p: CGPoint) {
         model = buildFlyModel()
@@ -417,9 +422,11 @@ final class Fly {
         brainLive = signals != nil
         liveArousal = signals?.arousal ?? 0
         liveWing = signals?.wingDrive ?? 0
+        liveFlightSteer = signals?.flightSteerBias ?? 0
+        liveHeadGroom = signals?.headGroomDrive ?? 0
 
         if state == .flying {
-            updateFlight(dt: dt)
+            updateFlight(dt: dt, bounds: bounds)
         } else if state == .eating {
             updateEating(dt: dt)
         } else if let s = signals {
@@ -640,7 +647,7 @@ final class Fly {
         node.position = p
     }
 
-    private func updateFlight(dt: CGFloat) {
+    private func updateFlight(dt: CGFloat, bounds: CGSize) {
         flightT = min(1, flightT + dt / flightDur)
         if flightT >= 1 {
             // touchdown flare: the timer ended, but the fly lands only when it
@@ -652,6 +659,24 @@ final class Fly {
             applyAltitude()
             if alt < 0.035 { pos = flightTo; land() }
             return
+        }
+        // Live flight steering: DNb01's real L-R difference (bilateral
+        // activity documented to explain ~90% of variance in differential
+        // wing-stroke amplitude during flight saccades) nudges the actual
+        // destination, not just a cosmetic wobble on top of a fixed path --
+        // this is the one place in the app where the brain genuinely decides
+        // WHERE the fly ends up, not just how it looks getting there.
+        // Previously flightTo was fixed at takeoff with zero influence after.
+        if liveFlightSteer != 0 {
+            let dx0 = flightTo.x - flightFrom.x, dy0 = flightTo.y - flightFrom.y
+            let len0 = max(1, hypot(dx0, dy0))
+            let px0 = -dy0 / len0, py0 = dx0 / len0
+            let nudge = liveFlightSteer * 55 * dt
+            flightTo.x += px0 * nudge
+            flightTo.y += py0 * nudge
+            let hw = bounds.width / 2 - EDGE_MARGIN, hh = bounds.height / 2 - EDGE_MARGIN
+            flightTo.x = clampf(flightTo.x, -hw, hw)
+            flightTo.y = clampf(flightTo.y, -hh, hh)
         }
         let e = smoothstep(flightT)
         let dx = flightTo.x - flightFrom.x, dy = flightTo.y - flightFrom.y
@@ -701,29 +726,42 @@ final class Fly {
             }
         } else if state == .grooming || state == .eating {
             let amp: CGFloat = state == .eating ? 0.15 : 0.25   // gentler nibble than a full groom
+            // DNg12 drives a real, distinct grooming subroutine from DNg11's
+            // front-leg rubbing: head sweeps targeting the antenna (Curr.
+            // Biol. 2021). When DNg12 is elevated above its own baseline
+            // (headWeight, from real spiking -- see SignalBuilder), the legs
+            // ease back and the head takes over, an emergent alternation
+            // driven by which real population is currently more active.
+            let headWeight: CGFloat = state == .grooming ? clampf(liveHeadGroom, 0, 1) : 0
+            let legAmp = amp * (1 - 0.6 * headWeight)
             for leg in model.legs {
                 if leg.isFront {
-                    leg.angle = 0.45 + amp * sin(time * 20 + leg.swingSign * 1.3)
-                    leg.lift = 0.55 + (amp * 0.6) * sin(time * 22)
+                    leg.angle = 0.45 + legAmp * sin(time * 20 + leg.swingSign * 1.3)
+                    leg.lift = 0.55 + (legAmp * 0.6) * sin(time * 22)
                 } else {
                     leg.angle += (0 - leg.angle) * min(1, 8 * dt)
                     leg.lift += (0 - leg.lift) * min(1, 8 * dt)
                 }
                 leg.apply()
             }
+            headSweepTarget = headWeight * 0.4 * sin(time * 9)
         } else if state == .flying {
             for leg in model.legs {
                 leg.angle += (-0.35 - leg.angle) * min(1, 6 * dt)
                 leg.lift += (0.5 - leg.lift) * min(1, 6 * dt)
                 leg.apply()
             }
+            headSweepTarget = 0
         } else {
             for leg in model.legs {
                 leg.angle += (0 - leg.angle) * min(1, 10 * dt)
                 leg.lift += (0 - leg.lift) * min(1, 10 * dt)
                 leg.apply()
             }
+            headSweepTarget = 0
         }
+        headSweep += (headSweepTarget - headSweep) * min(1, 6 * dt)
+        model.head.eulerAngles = SCNVector3(0, headSweep, 0)
     }
 
     private func updateWings(dt: CGFloat) {

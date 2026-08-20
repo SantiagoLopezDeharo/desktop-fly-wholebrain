@@ -30,7 +30,7 @@ VERSION = 1
 
 # role ids MUST match the Role enum in Sim.swift
 ROLES = ["other", "lc4", "lplc2", "gf", "dna01", "dna02", "dnp09", "dng11",
-         "mdn", "escw", "ascending", "sensory", "food_orn"]
+         "mdn", "escw", "ascending", "sensory", "food_orn", "dnb01", "dng12"]
 ROLE_ID = {r: i for i, r in enumerate(ROLES)}
 
 CORE_TYPES = {          # primary_type -> role (same set etl.py uses)
@@ -44,6 +44,19 @@ CORE_TYPES = {          # primary_type -> role (same set etl.py uses)
     # "sensory" bucket (tap/wind -> GF) undifferentiated from everything else.
     "ORN_DM1": "food_orn", "ORN_DM4": "food_orn", "ORN_VA2": "food_orn",
     "ORN_VM3": "food_orn", "ORN_DP1m": "food_orn",
+    # flight-steering command neuron: bilateral activity difference explains
+    # ~90% of variance in differential wing-stroke amplitude during flight
+    # saccades (Curr. Biol. 2017, 10.1016/j.cub.2017.02.032). Currently NO
+    # signal reaches flight direction after takeoff -- FlyModel.swift's
+    # startFlight() picks a fixed target once and flies a straight line to
+    # it. This is the real command neuron for that gap.
+    "DNb01": "dnb01",
+    # grooming subtype distinct from DNg11: DNg11 drives front-leg rubbing
+    # only, DNg12 drives head sweeps targeting the antenna (Curr. Biol. 2021,
+    # anterior grooming hierarchy paper). Pooling all 5 annotated subtypes
+    # (a-e) as one functional role, same as DNg11 is pooled.
+    "DNg12_a": "dng12", "DNg12_b": "dng12", "DNg12_c": "dng12",
+    "DNg12_d": "dng12", "DNg12_e": "dng12",
 }
 # super_class -> role, applied only where no CORE_TYPES match (input pathways)
 SUPER_ROLE = {"ascending": "ascending", "sensory_ascending": "ascending",
@@ -175,7 +188,7 @@ for i, rid in enumerate(ids):
 indeg = defaultdict(float)
 for (i, j), w in agg.items():
     indeg[role_of[j]] += abs(w)
-for r in ("gf", "dna01", "dna02", "dnp09", "dng11", "mdn", "escw"):
+for r in ("gf", "dna01", "dna02", "dnp09", "dng11", "mdn", "escw", "dnb01", "dng12"):
     print(f"  in-brain drive onto {r}: {indeg[r]:,.0f} syn")
 
 # food_orn is a sensory INPUT population (like lc4/lplc2/sensory), so the
