@@ -169,7 +169,20 @@ distance-based behavior (`signals: nil` path).
   settle duration per trial to get real independent samples, and compare
   against a matched *unstimulated* run at the same settle offset, not a raw
   diff, since DNa's resting L-R diff swings ±5 Hz from noise alone).
-  `foodSeek`'s direction stays geometric; only urgency is brain-derived.
+  **Retested with PFL3** (24 neurons, direct 496-syn input to DNa02, the
+  literature's actual steering-decision neuron, one hop closer to food_orn
+  than DNa) with the same corrected methodology, n=15/side: same verdict, for
+  a more interesting reason. food-L and food-R stimulation shifted PFL3's L-R
+  balance the *same* direction (+0.34 vs +0.38 Hz, real SNR ~0.85, not just
+  noise) instead of opposite directions — a real effect that isn't
+  directional. Central-complex heading is a ring/population-vector code
+  across ~16 EPG wedges; a left-half/right-half injection and readout is the
+  wrong lens for that representation, and a correct one (decoding the actual
+  EPG population vector) is a materially bigger undertaking, not attempted.
+  Plausibly reflects real biology too: flies steer fast/precise turns
+  visually, not via odor — consistent with this app's *visual* steering
+  (loom → DNa → turnBias) already working. `foodSeek`'s direction stays
+  geometric; only urgency is brain-derived.
 
 ## Repo conventions
 
