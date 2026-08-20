@@ -153,6 +153,23 @@ distance-based behavior (`signals: nil` path).
   4 ms (ring buffer); `weightScale`/`gapJunctionBoost` live in `Sim.swift`.
 - Landing must go through the flare (alt decays below 0.035) — never snap
   scale/z in `land()`.
+- **Measured and rejected: real DNa-based food steering.** food_orn synaptic
+  paths to DNa01/02 exist (3-4 hops, 7-43 syn bottleneck, confirmed by raw
+  graph BFS) but the *functional* signal is too weak/inconsistent to use:
+  stimulating food_orn-left produced the expected DNa left-bias in 8/10
+  trials (mean +1.4 Hz vs ±2.8 Hz trial noise — small relative to the noise);
+  food_orn-right produced the expected right-bias in only 3/10 (mean pointed
+  the *wrong* way). DNa01/02 is 2 neurons/side, so population-rate noise
+  dominates at that scale, and central-complex steering circuits are
+  documented as having crossed/non-obvious topology, so "same-side stim ->
+  same-side response" was never a safe assumption. Don't re-attempt this with
+  the same naive same-side/crossed framing without new evidence; if revisited,
+  measure properly first (LIFSim's RNG is seeded from a fixed default, so
+  repeated `LIFSim(fullBrain:)` calls are bit-for-bit identical — vary the
+  settle duration per trial to get real independent samples, and compare
+  against a matched *unstimulated* run at the same settle offset, not a raw
+  diff, since DNa's resting L-R diff swings ±5 Hz from noise alone).
+  `foodSeek`'s direction stays geometric; only urgency is brain-derived.
 
 ## Repo conventions
 
