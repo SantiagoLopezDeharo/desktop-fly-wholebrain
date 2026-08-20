@@ -17,6 +17,8 @@ struct BrainSignals {
     var arousal: CGFloat = 0    // whole-population activity, ~0..1
     var tempo: CGFloat = 1      // thermal "temperature" scaling of locomotion
     var sleep = false           // circadian + idle -> sleep-like state
+    var foodAttraction: CGFloat = 0  // food-odor ORN population rate, 0..1 (whole-brain only)
+    var hasFoodSense = false         // true only when the loaded brain has food_orn neurons
 }
 
 struct BrainPointsFile: Decodable {
@@ -81,7 +83,7 @@ struct Xorshift: RandomNumberGenerator {
 // instead of a String compare. Order MUST match ROLES in etl_fullbrain.py.
 enum Role: UInt8 {
     case other = 0, lc4, lplc2, gf, dna01, dna02, dnp09, dng11, mdn, escw,
-         ascending, sensory
+         ascending, sensory, foodOrn
     init?(slug: String) {
         switch slug {
         case "other": self = .other
@@ -96,6 +98,7 @@ enum Role: UInt8 {
         case "escw": self = .escw
         case "ascending": self = .ascending
         case "sensory": self = .sensory
+        case "food_orn": self = .foodOrn
         default: return nil
         }
     }
@@ -113,6 +116,7 @@ enum Role: UInt8 {
         case .escw: return "escw"
         case .ascending: return "ascending"
         case .sensory: return "sensory"
+        case .foodOrn: return "food_orn"
         }
     }
 }
@@ -225,6 +229,11 @@ final class LIFSim {
     private(set) var escw: [Int] = []      // DNp02/04/11 escape-maneuver (wing) DNs
     private(set) var ascend: [Int] = []    // ascending partners (leg proprioception)
     private(set) var sens: [Int] = []      // sensory partners (air-puff pathway)
+    // Food-odor ORNs (DM1/DM4/VA2/VM3/DP1m glomeruli, real cell types
+    // documented as attraction-driving). Whole-brain only: the 668-neuron
+    // circuit never includes these, so this stays empty there and food
+    // injection below is a harmless no-op for that mode.
+    private(set) var foodOrn: [Int] = []
     private var ascendPhase: [Float] = []  // per-ascending-neuron gait phase offset
 
     // inputs (0..1), set each frame by the coordinator
@@ -233,6 +242,7 @@ final class LIFSim {
     var gaitDrive: Float = 0   // body walking intensity -> ascending neurons
     var gaitPhase: Float = 0   // body gait phase 0..1 -> rhythmic proprioception
     var airPuff: Float = 0     // fast cursor motion near the fly -> sensory neurons
+    var foodDrive: Float = 0   // nearby food -> food-odor ORNs (proximity, 0..1)
     var activityScale: Float = 1  // circadian / sleep neuromodulation of baseline+noise
     var sensoryGate: Float = 1    // sleep gates sensory input (raised arousal threshold)
 
@@ -244,6 +254,7 @@ final class LIFSim {
     private(set) var rateFwd: Float = 0
     private(set) var rateGroom: Float = 0
     private(set) var rateEscW: Float = 0
+    private(set) var rateFoodOrn: Float = 0
     private(set) var ratePop: Float = 0    // whole-population Hz per neuron
     private var gfLatch = false
     private(set) var simMs: Int = 0
@@ -264,6 +275,7 @@ final class LIFSim {
     private let pNoise: Float = 0.0022
     private let noiseKick: Float = 0.42
     private let loomGain: Float = 0.30
+    private let foodOrnGain: Float = 0.34
     private let rateAlpha: Float = 1.0 / 120.0
     private var burstUntil = 0            // occasional "arousal" noise bursts
     private var burstNext = 12_000
@@ -412,6 +424,7 @@ final class LIFSim {
             case .escw: escw.append(i)
             case .ascending: ascend.append(i)
             case .sensory: sens.append(i)
+            case .foodOrn: foodOrn.append(i)
             case .other: break
             }
         }
@@ -434,7 +447,7 @@ final class LIFSim {
             // delivers 2.7k-24k synapses each, so a baseline that size
             // double-counts and pins every command on permanently.
             case .dna01, .dna02, .mdn, .dng11, .escw, .dnp09: base[i] = 0.004
-            case .sensory: base[i] = 0.006
+            case .sensory, .foodOrn: base[i] = 0.006
             default: base[i] = Float.random(in: 0.008...0.042, using: &baseRng)
             }
         }
@@ -506,6 +519,8 @@ final class LIFSim {
             }
             // fast air movement near the fly -> sensory pathway
             if airPuff > 0.001 { for i in sens { v[i] += airPuff * 0.12 * sensoryGate } }
+            // nearby food -> food-odor ORNs (empty group outside whole-brain mode)
+            if foodDrive > 0.001 { for i in foodOrn { v[i] += foodDrive * foodOrnGain * sensoryGate } }
             // brain-window click stimulation
             for s in activeStims where simMs < s.untilMs {
                 for i in s.idx { v[i] += s.strength }
@@ -534,7 +549,7 @@ final class LIFSim {
             qHead = (qHead + 1) % inhQueue.count
 
             // group rates (Hz per neuron, EMA)
-            var cLoom = 0, cDL = 0, cDR = 0, cM = 0, cF = 0, cG = 0, cW = 0
+            var cLoom = 0, cDL = 0, cDR = 0, cM = 0, cF = 0, cG = 0, cW = 0, cFO = 0
             for i in spiked {
                 switch Role(rawValue: roleId[i]) ?? .other {
                 case .lc4, .lplc2: cLoom += 1
@@ -543,6 +558,7 @@ final class LIFSim {
                 case .dnp09: cF += 1
                 case .dng11: cG += 1
                 case .escw: cW += 1
+                case .foodOrn: cFO += 1
                 case .gf: gfLatch = true
                 default: break
                 }
@@ -555,6 +571,7 @@ final class LIFSim {
             rateFwd  += (Float(cF)  * 1000 / Float(max(1, fwd.count))  - rateFwd)  * rateAlpha
             rateGroom += (Float(cG) * 1000 / Float(max(1, groom.count)) - rateGroom) * rateAlpha
             rateEscW += (Float(cW) * 1000 / Float(max(1, escw.count)) - rateEscW) * rateAlpha
+            rateFoodOrn += (Float(cFO) * 1000 / Float(max(1, foodOrn.count)) - rateFoodOrn) * rateAlpha
             ratePop  += (Float(spiked.count) * 1000 / Float(max(1, n)) - ratePop) * rateAlpha
 
             if homeostasis {

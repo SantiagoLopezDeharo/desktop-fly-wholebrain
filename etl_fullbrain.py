@@ -30,7 +30,7 @@ VERSION = 1
 
 # role ids MUST match the Role enum in Sim.swift
 ROLES = ["other", "lc4", "lplc2", "gf", "dna01", "dna02", "dnp09", "dng11",
-         "mdn", "escw", "ascending", "sensory"]
+         "mdn", "escw", "ascending", "sensory", "food_orn"]
 ROLE_ID = {r: i for i, r in enumerate(ROLES)}
 
 CORE_TYPES = {          # primary_type -> role (same set etl.py uses)
@@ -38,6 +38,12 @@ CORE_TYPES = {          # primary_type -> role (same set etl.py uses)
     "DNa02": "dna02", "DNa01": "dna01", "DNp09": "dnp09",
     "DNg11": "dng11", "MDN": "mdn",
     "DNp02": "escw", "DNp04": "escw", "DNp11": "escw",
+    # food-odor ORNs: antennal-lobe glomeruli documented as attraction-driving
+    # (DM1/Or42b, DM4/Or59b, VA2/Or92a, VM3, DP1m -- see Nat. Commun. 2019,
+    # 10.1038/s41467-019-09069-1). Without this they'd fall into the generic
+    # "sensory" bucket (tap/wind -> GF) undifferentiated from everything else.
+    "ORN_DM1": "food_orn", "ORN_DM4": "food_orn", "ORN_VA2": "food_orn",
+    "ORN_VM3": "food_orn", "ORN_DP1m": "food_orn",
 }
 # super_class -> role, applied only where no CORE_TYPES match (input pathways)
 SUPER_ROLE = {"ascending": "ascending", "sensory_ascending": "ascending",
@@ -171,3 +177,12 @@ for (i, j), w in agg.items():
     indeg[role_of[j]] += abs(w)
 for r in ("gf", "dna01", "dna02", "dnp09", "dng11", "mdn", "escw"):
     print(f"  in-brain drive onto {r}: {indeg[r]:,.0f} syn")
+
+# food_orn is a sensory INPUT population (like lc4/lplc2/sensory), so the
+# relevant check is the opposite direction: does injected excitation actually
+# go anywhere, or is it a dead end?
+outdeg = defaultdict(float)
+for (i, j), w in agg.items():
+    outdeg[role_of[i]] += abs(w)
+print(f"  food_orn outgoing drive onto the rest of the brain: {outdeg['food_orn']:,.0f} syn"
+      f" ({role_hist.get('food_orn', 0)} neurons)")

@@ -526,6 +526,13 @@ final class SignalBuilder {
         s.groomDrive = CGFloat(sim.rateGroom) / 8
         s.wingDrive = clampf(CGFloat(sim.rateEscW) / 10, 0, 1.3)
         s.arousal = clampf(CGFloat(sim.ratePop) / 20, 0, 1)
+        s.hasFoodSense = !sim.foodOrn.isEmpty   // whole-brain only; false for the 668 circuit
+        // calibrated against --brainbench's food-smell probe: the 244-neuron
+        // population's response to proximity is threshold-like (2 Hz at the
+        // edge of smell range, 62 Hz once clearly in range, 250 Hz saturated
+        // at contact) -- 190 puts "clearly in range" around attraction 0.3
+        // and saturates to 1.0 well before actual contact, not only at it
+        s.foodAttraction = clampf(CGFloat(sim.rateFoodOrn) / 190, 0, 1)
         return s
     }
 }
@@ -542,6 +549,7 @@ final class SimRunner {
     private var inLoomL: Float = 0, inLoomR: Float = 0, inAirPuff: Float = 0
     private var inGaitDrive: Float = 0, inGaitPhase: Float = 0
     private var inActivity: Float = 1, inSensoryGate: Float = 1
+    private var inFoodDrive: Float = 0
 
     private var latest = BrainSignals()
     private var escapeLatched = false
@@ -551,11 +559,13 @@ final class SimRunner {
     init(sim: LIFSim) { self.sim = sim }
 
     func setInputs(loomL: Float, loomR: Float, airPuff: Float, gaitDrive: Float,
-                   gaitPhase: Float, activityScale: Float, sensoryGate: Float) {
+                   gaitPhase: Float, activityScale: Float, sensoryGate: Float,
+                   foodDrive: Float = 0) {
         lock.lock()
         inLoomL = loomL; inLoomR = loomR; inAirPuff = airPuff
         inGaitDrive = gaitDrive; inGaitPhase = gaitPhase
         inActivity = activityScale; inSensoryGate = sensoryGate
+        inFoodDrive = foodDrive
         lock.unlock()
     }
 
@@ -586,6 +596,7 @@ final class SimRunner {
             sim.loomL = inLoomL; sim.loomR = inLoomR; sim.airPuff = inAirPuff
             sim.gaitDrive = inGaitDrive; sim.gaitPhase = inGaitPhase
             sim.activityScale = inActivity; sim.sensoryGate = inSensoryGate
+            sim.foodDrive = inFoodDrive
             lock.unlock()
 
             let now = DispatchTime.now().uptimeNanoseconds
@@ -822,13 +833,18 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
             let act = (1 - (1 - activity) * 0.35) * (sleepy ? 0.75 : 1)
             let gate: Float = sleepy ? 0.55 : 1
             loomOverride = max(0, loomOverride - dt * 1.2)   // override decays
+            // nearest food to fly #1, as a proximity reading only -- this does
+            // NOT claim it as a steering target (that happens per-fly below)
+            let foodDrive = foodPositions.values.map { p -> Float in
+                Float(clampf(1 - hypot(p.x - first.pos.x, p.y - first.pos.y) / FOOD_SMELL_RADIUS, 0, 1))
+            }.max() ?? 0
 
             var s: BrainSignals
             if let runner = runner {
                 // whole brain: stepped on its own thread, we just exchange values
                 runner.setInputs(loomL: loomL, loomR: loomR, airPuff: puff,
                                  gaitDrive: gaitDrive, gaitPhase: gaitPhase,
-                                 activityScale: act, sensoryGate: gate)
+                                 activityScale: act, sensoryGate: gate, foodDrive: foodDrive)
                 s = runner.takeSignals()
             } else {
                 sim.loomL = loomL
@@ -838,6 +854,7 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
                 sim.gaitPhase = gaitPhase
                 sim.activityScale = act
                 sim.sensoryGate = gate
+                sim.foodDrive = foodDrive
                 msAccumulator += Double(dt) * 1000
                 let steps = min(50, Int(msAccumulator))
                 msAccumulator -= Double(steps)
@@ -1175,6 +1192,27 @@ func runBrainBench() {
     print(String(format: "  DNa L/R %.1f/%.1f Hz | DNp09 %.1f Hz | DNg11 %.1f Hz | MDN %.1f Hz | escW %.1f Hz",
                  sim.rateDNaL, sim.rateDNaR, sim.rateFwd, sim.rateGroom, sim.rateMDN, sim.rateEscW))
 
+    print("\n--- food smell: food_orn population (244 real ORNs, DM1/DM4/VA2/VM3/DP1m) ---")
+    print(String(format: "  rate at rest: %.2f Hz", sim.rateFoodOrn))
+    sim.foodDrive = 0.4   // "clearly in smell range, not yet touching it"
+    for _ in 0..<20 { sim.step(50) }   // 1s: let the rate EMA (tau 120ms) settle
+    _ = sim.consumeGF()
+    var gfDuringFood = 0
+    for _ in 0..<40 { sim.step(50); if sim.consumeGF() { gfDuringFood += 1 } }   // 2s sustained
+    let smellBuilder = SignalBuilder()
+    let smelling = smellBuilder.make(sim, dt: 1.0 / 60)
+    print(String(format: "  foodDrive=0.4 sustained 2s -> rate %.2f Hz, foodAttraction %.2f, "
+                 + "popRate %.2f Hz, false GF escapes: %d",
+                 sim.rateFoodOrn, smelling.foodAttraction, sim.ratePop, gfDuringFood))
+    sim.foodDrive = 0
+    for _ in 0..<20 { sim.step(50) }
+    let notSmelling = smellBuilder.make(sim, dt: 1.0 / 60)
+    print(String(format: "  foodDrive=0 for 1s after -> rate %.2f Hz, foodAttraction %.2f",
+                 sim.rateFoodOrn, notSmelling.foodAttraction))
+    let smellOK = smelling.hasFoodSense && smelling.foodAttraction > 0.3
+        && notSmelling.foodAttraction < FOOD_SMELL_THRESHOLD && gfDuringFood == 0
+    print("  responds to proximity, fades when it's gone, no false escape: \(smellOK ? "PASS" : "FAIL")")
+
     print(String(format: "\nrealtime budget: need <=1.00 ms wall per sim-ms; settled pop %.2f Hz", settled))
 
     // --- does the whole brain actually drive the body? ---
@@ -1229,6 +1267,31 @@ func runBrainBench() {
              stim: { $0.loomL = 1.0; $0.loomR = 1.0 }, hold: 0.6,
              check: { $0.state == .flying }, describe: { "state=\($0.state)" })
     sim.loomL = 0; sim.loomR = 0
+
+    // food: doesn't fit the generic scenario() helper above (needs foodDrive
+    // recomputed from live distance every step, not a one-shot stimulus), so
+    // it's a standalone loop -- but it exercises the exact same real path:
+    // proximity -> food_orn spikes -> BrainSignals.foodAttraction -> approach
+    do {
+        let fly = Fly(at: .zero)
+        fly.state = .idle
+        let food = FoodTarget(id: 1, pos: CGPoint(x: 80, y: 0))
+        sim.step(600); _ = sim.consumeGF()
+        var passed = false
+        var frames = Int(3.0 / dt)
+        while frames > 0 {
+            frames -= 1
+            let d = hypot(food.pos.x - fly.pos.x, food.pos.y - fly.pos.y)
+            sim.foodDrive = Float(clampf(1 - d / FOOD_SMELL_RADIUS, 0, 1))
+            sim.step(Int((dt * 1000).rounded()))
+            let s = builder.make(sim, dt: dt)
+            fly.update(dt: dt, bounds: bounds, mouse: nil, food: food, signals: s)
+            if fly.state == .eating { passed = true; break }
+        }
+        sim.foodDrive = 0
+        if !passed { failures += 1 }
+        print("  \(passed ? "PASS" : "FAIL")  food: real ORN spiking drives approach: state=\(fly.state)")
+    }
 
     print(failures == 0 ? "\nWHOLE BRAIN DRIVES THE BODY: all scenarios pass"
                         : "\n\(failures) scenario(s) failed")

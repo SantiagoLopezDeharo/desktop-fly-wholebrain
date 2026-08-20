@@ -11,15 +11,20 @@ let EDGE_MARGIN: CGFloat = 50
 let SCARE_RADIUS: CGFloat = 110        // legacy behavior (non-connectome flies) only
 let NERVOUS_RADIUS: CGFloat = 240      // legacy behavior only
 
-// Food: no real appetitive/olfactory circuit is wired in this subset of the
-// connectome (that would be a new-neuron-population project of its own — see
-// CLAUDE.md's recipe), so "smell" is modeled directly as a behavioral pull on
-// heading/speed, the same honesty tradeoff the README already makes for
-// window-loom stimuli. It still respects state priority: escape, sleep, and
-// an active dart/backward-walk all pre-empt it.
+// Food: whole-brain mode has real food-odor ORNs (244 neurons across the
+// DM1/DM4/VA2/VM3/DP1m glomeruli, documented attraction-driving cell types —
+// see Sim.swift's `foodOrn`), so smell there is genuine spiking, not a
+// stand-in. The 668-neuron circuit never includes them, and legacy
+// (brainless) flies have no brain at all — both fall back to a direct
+// distance-based pull, same honesty tradeoff the README already makes for
+// window-loom stimuli. Priority is unchanged either way: escape, sleep, and
+// an active dart/backward-walk all pre-empt this.
 let FOOD_SMELL_RADIUS: CGFloat = 260
 let FOOD_EAT_RADIUS: CGFloat = 16
 let FOOD_EAT_DURATION: CGFloat = 2.0
+// below this, real ORN spiking hasn't risen above simulation noise -- treat
+// it as "hasn't smelled it yet," not "smells it a tiny bit"
+let FOOD_SMELL_THRESHOLD: CGFloat = 0.04
 
 struct FoodTarget { let id: Int; let pos: CGPoint }
 
@@ -420,7 +425,7 @@ final class Fly {
         } else if let s = signals {
             brainBehavior(s, dt: dt, bounds: bounds, mouse: mouse)
             if state == .walking { updateWalk(dt: dt, bounds: bounds) }
-            foodSeek(food, dt: dt)
+            foodSeek(food, dt: dt, smell: s)
         } else {
             if scareCooldown == 0, let m = mouse {
                 // legacy distance-based fear (extra, brainless flies)
@@ -442,7 +447,7 @@ final class Fly {
                     else { pickNextState() }
                 }
                 if state == .walking { updateWalk(dt: dt, bounds: bounds) }
-                foodSeek(food, dt: dt)
+                foodSeek(food, dt: dt, smell: nil)
             }
         }
 
@@ -524,11 +529,21 @@ final class Fly {
         }
     }
 
-    // Positive smell: steer and walk toward nearby food, strongest close up.
-    // Lower priority than everything upstream (escape/sleep/dart/backward all
-    // already returned or hold their own heading before this runs), so it
-    // only ever engages a fly that's otherwise free to wander.
-    private func foodSeek(_ food: FoodTarget?, dt: CGFloat) {
+    // Positive smell: steer and walk toward nearby food. Lower priority than
+    // everything upstream (escape/sleep/dart/backward all already returned or
+    // hold their own heading before this runs), so it only ever engages a fly
+    // that's otherwise free to wander.
+    //
+    // Direction is always geometric (atan2 to the food's actual position) --
+    // that's sensory-transduction geometry, the same category as how the loom
+    // pathway's own left/right injection strength is computed, not a claim
+    // about brain involvement. What genuinely comes from the brain, when one
+    // with real food-odor ORNs is attached (whole-brain mode only --
+    // `hasFoodSense` is false for the 668-neuron circuit and for legacy
+    // brainless flies), is *whether the fly reacts at all and how urgently*:
+    // walking speed is driven entirely by the real ORN population rate, gated
+    // on it crossing a real spiking threshold, not by raw distance.
+    private func foodSeek(_ food: FoodTarget?, dt: CGFloat, smell: BrainSignals?) {
         guard let food = food, dartTimer == 0, backwardTimer == 0,
               state == .walking || state == .idle else { return }
         let d = hypot(food.pos.x - pos.x, food.pos.y - pos.y)
@@ -541,12 +556,18 @@ final class Fly {
             ledge = nil
             return
         }
+        let urgency: CGFloat
+        if let s = smell, s.hasFoodSense {
+            guard s.foodAttraction > FOOD_SMELL_THRESHOLD else { return }   // hasn't registered yet
+            urgency = s.foodAttraction
+        } else {
+            urgency = clampf(1 - d / FOOD_SMELL_RADIUS, 0, 1)
+        }
         if state != .walking { setState(.walking) }
         ledge = nil
         let target = atan2(food.pos.y - pos.y, food.pos.x - pos.x)
         heading += angleDiff(heading, target) * min(1, 3.2 * dt)
-        let pull = clampf(1 - d / FOOD_SMELL_RADIUS, 0, 1)
-        let desired = 30 + pull * 70
+        let desired = 30 + urgency * 70
         speed += (desired - speed) * min(1, 2.4 * dt)
     }
 

@@ -46,6 +46,17 @@ Whole-brain specifics, all in `Sim.swift`:
   a step costs ~3 ms per simulated ms. It falls behind gracefully (brain in
   slow motion) rather than spiralling; it does **not** hit 1 kHz realtime on
   4-core Intel.
+- **`food_orn` (244)**: DM1/DM4/VA2/VM3/DP1m antennal-lobe glomeruli, real
+  cell types documented as attraction-driving (Nat. Commun. 2019,
+  10.1038/s41467-019-09069-1). Whole-brain only — the 668 circuit never
+  includes them. `Coordinator` computes proximity to the nearest `FoodItem`
+  and sets `sim.foodDrive` (0..1); the resulting `sim.rateFoodOrn` becomes
+  `BrainSignals.foodAttraction`, read by `Fly.foodSeek` (`FlyModel.swift`) to
+  drive walking urgency. Direction-finding stays geometric (atan2 to the
+  food's actual position) — that's sensory-transduction geometry, same
+  category as how the loom pathway's own L/R injection split is computed, not
+  a claim that steering itself is brain-derived. `--brainbench` probes the
+  response curve and checks it doesn't leak into a false GF escape.
 
 ## Build, run, verify
 

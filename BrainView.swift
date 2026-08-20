@@ -91,6 +91,7 @@ private func roleColor(_ role: String) -> SIMD4<Float>? {
     case "dng11": return SIMD4(0.75, 0.55, 1.0, 1)
     case "escw": return SIMD4(1.0, 0.35, 0.25, 1)
     case "gf": return SIMD4(1.0, 0.95, 0.4, 1)
+    case "food_orn": return SIMD4(0.85, 0.60, 0.10, 1)
     default: return nil
     }
 }
@@ -134,7 +135,7 @@ func buildBrainScene(points: BrainPointsFile?, sim: LIFSim, wholeBrain: Bool) ->
         // get lost in 139k points (cheap: these lists are a few hundred long).
         // additive here is fine — these are a few hundred sparse markers.
         let named = sim.loomLeft + sim.loomRight + sim.gf + sim.dnaL + sim.dnaR
-                  + sim.mdn + sim.fwd + sim.groom + sim.escw
+                  + sim.mdn + sim.fwd + sim.groom + sim.escw + sim.foodOrn
         if !named.isEmpty {
             var npts: [SIMD3<Float>] = []
             var ncols: [SIMD4<Float>] = []
@@ -458,6 +459,7 @@ final class BrainWindowController {
         case "dng11":        return "⚡ Grooming command (DNg11)"
         case "escw":         return "⚡ Escape-wing DNs (DNp02/04/11)"
         case "mdn":          return "⚡ Moonwalker neurons (MDN)"
+        case "food_orn":     return "🍯 Food-odor ORNs (DM1/DM4/VA2/VM3/DP1m)"
         default:
             var t = sim.types[picked.first(where: { sim.roles[$0] == "other" }) ?? picked[0]]
             if t.isEmpty || t == "?" { t = "central" }
